@@ -17,15 +17,10 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Switch to agda-bisect PR
+    - name: Ensure bin dir
       run: |
-        git fetch origin bisect-v2
-        git checkout bisect-v2
-
-    - uses: haskell/actions/setup@v2
-      id:   setup
-      with:
-        ghc-version: ${{ env.GHC_VER }}
+        mkdir -p "$HOME/.cabal/bin"
+        echo "$HOME/.cabal/bin" >> "${GITHUB_PATH}"
 
     - name: Install cabal-plan
       run: |
@@ -35,6 +30,16 @@ jobs:
         rm -f cabal-plan.xz
         chmod a+x "$HOME/.cabal/bin/cabal-plan"
         cabal-plan --version
+
+    - name: Switch to agda-bisect PR
+      run: |
+        git fetch origin bisect-v2
+        git checkout bisect-v2
+
+    - uses: haskell/actions/setup@v2
+      id:   setup
+      with:
+        ghc-version: ${{ env.GHC_VER }}
 
     - uses: actions/cache/restore@v3
       with:
