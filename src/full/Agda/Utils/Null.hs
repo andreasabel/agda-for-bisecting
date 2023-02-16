@@ -1,6 +1,5 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-{-# LANGUAGE CPP               #-}
 
 -- | Overloaded @null@ and @empty@ for collections and sequences.
 
@@ -9,10 +8,16 @@ module Agda.Utils.Null where
 import Prelude hiding (null)
 
 import Control.Monad
+import Control.Monad.Except   ( ExceptT )
+import Control.Monad.Identity ( Identity(..) )
+import Control.Monad.Reader   ( ReaderT )
+import Control.Monad.State    ( StateT  )
+import Control.Monad.Writer   ( WriterT )
+import Control.Monad.Trans    ( lift    )
 
-import Data.ByteString.Char8 (ByteString)
-import qualified Data.ByteString.Char8 as ByteString
-import Data.Function
+import qualified Data.ByteString.Char8 as ByteStringChar8
+import qualified Data.ByteString.Lazy as ByteStringLazy
+
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashSet (HashSet)
@@ -24,16 +29,20 @@ import qualified Data.IntSet as IntSet
 import qualified Data.List as List
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Monoid
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import Data.Set (Set)
 import qualified Data.Set as Set
 
-import Text.PrettyPrint (Doc, render)
+import Data.Text (Text)
+import qualified Data.Text as Text
+
+import Text.PrettyPrint (Doc, isEmpty)
 
 import Agda.Utils.Bag (Bag)
 import qualified Agda.Utils.Bag as Bag
+
+import Agda.Utils.Impossible
 
 class Null a where
   empty :: a
@@ -51,9 +60,25 @@ instance (Null a, Null b) => Null (a,b) where
   empty      = (empty, empty)
   null (a,b) = null a && null b
 
-instance Null ByteString where
-  empty = ByteString.empty
-  null  = ByteString.null
+instance (Null a, Null b, Null c) => Null (a,b,c) where
+  empty        = (empty, empty, empty)
+  null (a,b,c) = null a && null b && null c
+
+instance (Null a, Null b, Null c, Null d) => Null (a,b,c,d) where
+  empty          = (empty, empty, empty, empty)
+  null (a,b,c,d) = null a && null b && null c && null d
+
+instance Null ByteStringChar8.ByteString where
+  empty = ByteStringChar8.empty
+  null  = ByteStringChar8.null
+
+instance Null ByteStringLazy.ByteString where
+  empty = ByteStringLazy.empty
+  null  = ByteStringLazy.null
+
+instance Null Text where
+  empty = Text.empty
+  null  = Text.null
 
 instance Null [a] where
   empty = []
@@ -99,15 +124,45 @@ instance Null (Maybe a) where
 
 instance Null Doc where
   empty = mempty
-  null  = (== mempty)
+  null  = isEmpty
+
+instance Null a => Null (Identity a) where
+  empty = return empty
+  null  = null . runIdentity
+
+instance Null a => Null (IO a) where
+  empty = return empty
+  null  = __IMPOSSIBLE__
+
+instance (Null (m a), Monad m) => Null (ExceptT e m a) where
+  empty = lift empty
+  null  = __IMPOSSIBLE__
+
+instance (Null (m a), Monad m) => Null (ReaderT r m a) where
+  empty = lift empty
+  null  = __IMPOSSIBLE__
+
+instance (Null (m a), Monad m) => Null (StateT s m a) where
+  empty = lift empty
+  null  = __IMPOSSIBLE__
+
+instance (Null (m a), Monad m, Monoid w) => Null (WriterT w m a) where
+  empty = lift empty
+  null  = __IMPOSSIBLE__
 
 -- * Testing for null.
 
 ifNull :: (Null a) => a -> b -> (a -> b) -> b
 ifNull a b k = if null a then b else k a
 
+ifNotNull :: (Null a) => a -> (a -> b) -> b -> b
+ifNotNull a k b = ifNull a b k
+
 ifNullM :: (Monad m, Null a) => m a -> m b -> (a -> m b) -> m b
 ifNullM ma mb k = ma >>= \ a -> ifNull a mb k
+
+ifNotNullM :: (Monad m, Null a) => m a -> (a -> m b) -> m b -> m b
+ifNotNullM ma k mb = ifNullM ma mb k
 
 whenNull :: (Monad m, Null a) => a -> m () -> m ()
 whenNull = when . null

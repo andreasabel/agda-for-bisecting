@@ -1,12 +1,9 @@
+{-# OPTIONS --cubical #-}
 module _ where
 
 open import Agda.Primitive.Cubical
+open import Agda.Builtin.Cubical.Path
 open import Agda.Builtin.Nat
-
-postulate
-  PathP : ∀ {ℓ} (A : I → Set ℓ) → A i0 → A i1 → Set ℓ
-
-{-# BUILTIN PATHP        PathP     #-}
 
 postulate
   A : Set

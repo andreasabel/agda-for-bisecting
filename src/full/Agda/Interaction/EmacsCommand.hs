@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 
 ------------------------------------------------------------------------
 -- | Code for instructing Emacs to do things
@@ -9,15 +8,10 @@ module Agda.Interaction.EmacsCommand
   , response
   , putResponse
   , display_info'
-  , display_warning
   , clearRunningInfo
   , clearWarning
   , displayRunningInfo
   ) where
-
-#if MIN_VERSION_base(4,11,0)
-import Prelude hiding ((<>))
-#endif
 
 import qualified Data.List as List
 
@@ -39,18 +33,18 @@ data Lisp a
 
 instance Pretty a => Pretty (Lisp a) where
   pretty (A a )     = pretty a
-  pretty (Cons a b) = parens (pretty a <+> text "." <+> pretty b)
+  pretty (Cons a b) = parens (pretty a <+> "." <+> pretty b)
   pretty (L xs)     = parens (hsep (map pretty xs))
-  pretty (Q x)      = text "'" <> pretty x
+  pretty (Q x)      = "'" <> pretty x
 
-instance Show (Lisp String) where
-  showsPrec _ (A a)      = showString a
-  showsPrec p (Cons a b) = showString "(" . showsPrec p a . showString " . " .
-                                            showsPrec p b . showString ")"
-  showsPrec p (L xs)     = showString "(" . foldr (.) (showString ")")
-                                              (List.intersperse (showString " ")
-                                                 (map (showsPrec p) xs))
-  showsPrec p (Q x)      = showString "'" . showsPrec p x
+-- instance Show (Lisp String) where
+--   showsPrec _ (A a)      = showString a
+--   showsPrec p (Cons a b) = showString "(" . showsPrec p a . showString " . " .
+--                                             showsPrec p b . showString ")"
+--   showsPrec p (L xs)     = showString "(" . foldr (.) (showString ")")
+--                                               (List.intersperse (showString " ")
+--                                                  (map (showsPrec p) xs))
+--   showsPrec p (Q x)      = showString "'" . showsPrec p x
 
 -- | Formats a response command.
 --
@@ -82,9 +76,6 @@ displayInBuffer buffername append header content =
 
 display_info' :: Bool -> String -> String -> Lisp String
 display_info' = displayInBuffer "agda2-info-action"
-
-display_warning :: String -> String -> Lisp String
-display_warning = displayInBuffer "agda2-warning-action" False
 
 ------------------------------------------------------------------------
 -- Running info

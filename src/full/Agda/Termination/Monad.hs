@@ -1,6 +1,3 @@
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- | The monad for the termination checker.
 --
@@ -13,17 +10,22 @@ module Agda.Termination.Monad where
 import Prelude hiding (null)
 
 import Control.Applicative hiding (empty)
+
+import qualified Control.Monad.Fail as Fail
+
+import Control.Monad          ( forM )
+import Control.Monad.IO.Class ( MonadIO(..) )
+import Control.Monad.Except
 import Control.Monad.Reader
-import Control.Monad.State
 
-import Data.Foldable (Foldable)
-import Data.Traversable (Traversable)
-import Data.Monoid ( Monoid(..) )
+import Data.DList (DList)
+import qualified Data.DList as DL
 import Data.Semigroup ( Semigroup(..) )
+import Data.Set (Set)
+import qualified Data.Set as Set
 
-import Agda.Interaction.Options
+import Agda.Interaction.Options (optTerminationDepth)
 
-import Agda.Syntax.Abstract (IsProjP(..), AllNames)
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
 import Agda.Syntax.Internal.Pattern
@@ -32,20 +34,20 @@ import Agda.Syntax.Position (noRange)
 
 import Agda.Termination.CutOff
 import Agda.Termination.Order (Order,le,unknown)
-import Agda.Termination.RecCheck (anyDefs)
+import Agda.Termination.RecCheck (MutualNames, anyDefs)
 
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Monad.Benchmark
-import Agda.TypeChecking.Monad.Builtin
-import Agda.TypeChecking.Pretty hiding ((<>))
+import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Records
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute
 
-import Agda.Utils.Except ( MonadError(catchError, throwError) )
+import Agda.Utils.Benchmark as B
 import Agda.Utils.Function
 import Agda.Utils.Functor
 import Agda.Utils.Lens
+import Agda.Utils.List   ( hasElem )
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Monoid
@@ -55,19 +57,18 @@ import qualified Agda.Utils.Pretty as P
 import Agda.Utils.VarSet (VarSet)
 import qualified Agda.Utils.VarSet as VarSet
 
-#include "undefined.h"
 import Agda.Utils.Impossible
-
--- | The mutual block we are checking.
---
---   The functions are numbered according to their order of appearance
---   in this list.
-
-type MutualNames = [QName]
 
 -- | The target of the function we are checking.
 
-type Target = QName
+data Target
+  = TargetDef QName
+      -- ^ The target of recursion is a @record@, @data@, or unreducible @Def@.
+  | TargetRecord
+      -- ^ We are termination-checking a record.
+  | TargetOther
+      -- ^ None of the above two or unknown.
+  deriving (Eq, Show)
 
 -- | The current guardedness level.
 
@@ -81,11 +82,6 @@ data TerEnv = TerEnv
 
   { terUseDotPatterns :: Bool
     -- ^ Are we mining dot patterns to find evindence of structal descent?
-  , terGuardingTypeConstructors :: Bool
-    -- ^ Do we assume that record and data type constructors
-    --   preserve guardedness?
-  , terInlineWithFunctions :: Bool
-    -- ^ Do we inline with functions to enhance termination checking of with?
   , terSizeSuc :: Maybe QName
     -- ^ The name of size successor, if any.
   , terSharp   :: Maybe QName
@@ -101,13 +97,13 @@ data TerEnv = TerEnv
     -- ^ The names of the functions in the mutual block we are checking.
     --   This includes the internally generated functions
     --   (with, extendedlambda, coinduction).
-  , terUserNames :: [QName]
+  , terUserNames :: Set QName
     -- ^ The list of name actually appearing in the file (abstract syntax).
     --   Excludes the internally generated functions.
   , terHaveInlinedWith :: Bool
     -- ^ Does the actual clause result from with-inlining?
     --   (If yes, it may be ill-typed.)
-  , terTarget  :: Maybe Target
+  , terTarget  :: Target
     -- ^ Target type of the function we are currently termination checking.
     --   Only the constructors of 'Target' are considered guarding.
   , terDelayed :: Delayed
@@ -148,16 +144,11 @@ data TerEnv = TerEnv
 --   of these values.
 --
 --   Values that do not have a safe default are set to
---   @IMPOSSIBLE@.
-
---   Note: Do not write @__IMPOSSIBLE__@ in the haddock comment above
---   since it will be expanded by the CPP, leading to a haddock parse error.
+--   @__IMPOSSIBLE__@.
 
 defaultTerEnv :: TerEnv
 defaultTerEnv = TerEnv
   { terUseDotPatterns           = False -- must be False initially!
-  , terGuardingTypeConstructors = False
-  , terInlineWithFunctions      = True
   , terSizeSuc                  = Nothing
   , terSharp                    = Nothing
   , terCutOff                   = defaultCutOff
@@ -165,7 +156,7 @@ defaultTerEnv = TerEnv
   , terMutual                   = __IMPOSSIBLE__ -- needs to be set!
   , terCurrent                  = __IMPOSSIBLE__ -- needs to be set!
   , terHaveInlinedWith          = False
-  , terTarget                   = Nothing
+  , terTarget                   = TargetOther
   , terDelayed                  = NotDelayed
   , terMaskArgs                 = repeat False   -- use all arguments (mask none)
   , terMaskResult               = False          -- use result (do not mask)
@@ -189,11 +180,35 @@ class (Functor m, Monad m) => MonadTer m where
 -- | Termination monad.
 
 newtype TerM a = TerM { terM :: ReaderT TerEnv TCM a }
-  deriving ( Functor, Applicative, Monad, MonadError TCErr
-           , MonadBench Phase, HasOptions, MonadDebug, HasConstInfo
-           , MonadIO, MonadTCEnv, MonadTCState, MonadTCM
-           , ReadTCState, MonadReduce
+  deriving ( Functor
+           , Applicative
+           , Monad
+           , Fail.MonadFail
+           , MonadError TCErr
+           , MonadStatistics
+           , HasOptions
+           , HasBuiltins
+           , MonadDebug
+           , HasConstInfo
+           , MonadIO
+           , MonadTCEnv
+           , MonadTCState
+           , MonadTCM
+           , ReadTCState
+           , MonadReduce
+           , MonadAddContext
+           , PureTCM
            )
+
+-- This could be derived automatically, but the derived type family becomes `BenchPhase (ReaderT TerEnv TCM)` which
+-- is *fine* but triggers complaints that the "type family application is no smaller than the instance head, why not
+-- nuke everything with UndecidableInstances".
+instance MonadBench TerM where
+  type BenchPhase TerM = Phase
+  getBenchmark              = TerM $ B.getBenchmark
+  putBenchmark              = TerM . B.putBenchmark
+  modifyBenchmark           = TerM . B.modifyBenchmark
+  finally (TerM m) (TerM f) = TerM $ (B.finally m f)
 
 instance MonadTer TerM where
   terAsk     = TerM $ ask
@@ -218,17 +233,8 @@ runTerDefault cont = do
   -- The name of sharp (if available).
   sharp <- fmap nameOfSharp <$> coinductionKit
 
-  guardingTypeConstructors <-
-    optGuardingTypeConstructors <$> pragmaOptions
-
-  -- Andreas, 2014-08-28
-  -- We do not inline with functions if --without-K.
-  inlineWithFunctions <- not . optWithoutK <$> pragmaOptions
-
   let tenv = defaultTerEnv
-        { terGuardingTypeConstructors = guardingTypeConstructors
-        , terInlineWithFunctions      = inlineWithFunctions
-        , terSizeSuc                  = suc
+        { terSizeSuc                  = suc
         , terSharp                    = sharp
         , terCutOff                   = cutoff
         }
@@ -251,12 +257,6 @@ instance (Semigroup m, Monoid m) => Monoid (TerM m) where
   mconcat = mconcat <.> sequence
 
 -- * Modifiers and accessors for the termination environment in the monad.
-
-terGetGuardingTypeConstructors :: TerM Bool
-terGetGuardingTypeConstructors = terAsks terGuardingTypeConstructors
-
-terGetInlineWithFunctions :: TerM Bool
-terGetInlineWithFunctions = terAsks terInlineWithFunctions
 
 terGetUseDotPatterns :: TerM Bool
 terGetUseDotPatterns = terAsks terUseDotPatterns
@@ -282,13 +282,13 @@ terGetCutOff = terAsks terCutOff
 terGetMutual :: TerM MutualNames
 terGetMutual = terAsks terMutual
 
-terGetUserNames :: TerM [QName]
+terGetUserNames :: TerM (Set QName)
 terGetUserNames = terAsks terUserNames
 
-terGetTarget :: TerM (Maybe Target)
+terGetTarget :: TerM Target
 terGetTarget = terAsks terTarget
 
-terSetTarget :: Maybe Target -> TerM a -> TerM a
+terSetTarget :: Target -> TerM a -> TerM a
 terSetTarget t = terLocal $ \ e -> e { terTarget = t }
 
 terGetHaveInlinedWith :: TerM Bool
@@ -339,10 +339,6 @@ terSetGuarded = terModifyGuarded . const
 terUnguarded :: TerM a -> TerM a
 terUnguarded = terSetGuarded unknown
 
--- | Should the codomain part of a function type preserve guardedness?
-terPiGuarded :: TerM a -> TerM a
-terPiGuarded m = ifM terGetGuardingTypeConstructors m $ terUnguarded m
-
 -- | Lens for '_terSizeDepth'.
 
 terSizeDepth :: Lens' Int TerEnv
@@ -375,17 +371,17 @@ withUsableVars :: UsableSizeVars a => a -> TerM b -> TerM b
 withUsableVars pats m = do
   vars <- usableSizeVars pats
   reportSLn "term.size" 70 $ "usableSizeVars = " ++ show vars
-  reportSDoc "term.size" 20 $ if null vars then text "no usuable size vars" else
-    text "the size variables amoung these variables are usable: " <+>
+  reportSDoc "term.size" 20 $ if null vars then "no usuable size vars" else
+    "the size variables amoung these variables are usable: " <+>
       sep (map (prettyTCM . var) $ VarSet.toList vars)
   terSetUsableVars vars $ m
 
 -- | Set 'terUseSizeLt' when going under constructor @c@.
 conUseSizeLt :: QName -> TerM a -> TerM a
 conUseSizeLt c m = do
-  caseMaybeM (liftTCM $ isRecordConstructor c)
+  ifM (liftTCM $ isEtaOrCoinductiveRecordConstructor c)  -- Non-eta inductive records are the same as datatypes
+    (terSetUseSizeLt False m)
     (terSetUseSizeLt True m)
-    (const $ terSetUseSizeLt False m)
 
 -- | Set 'terUseSizeLt' for arguments following projection @q@.
 --   We disregard j<i after a non-coinductive projection.
@@ -405,7 +401,7 @@ isProjectionButNotCoinductive :: MonadTCM tcm => QName -> tcm Bool
 isProjectionButNotCoinductive qn = liftTCM $ do
   b <- isProjectionButNotCoinductive' qn
   reportSDoc "term.proj" 60 $ do
-    text "identifier" <+> prettyTCM qn <+> do
+    "identifier" <+> prettyTCM qn <+> do
       text $
         if b then "is an inductive projection"
           else "is either not a projection or coinductive"
@@ -459,17 +455,17 @@ isCoinductiveProjection mustBeRecursive q = liftTCM $ do
                 -- A (2017-01-13): Yes, since we also normalize during positivity check?
                 -- See issue #1899.
                 reportSDoc "term.guardedness" 40 $ inTopContext $ sep
-                  [ text "looking for recursive occurrences of"
+                  [ "looking for recursive occurrences of"
                   , sep (map prettyTCM mut)
-                  , text "in"
+                  , "in"
                   , addContext pars $ prettyTCM (telFromList tel')
-                  , text "and"
+                  , "and"
                   , addContext tel $ prettyTCM core
                   ]
                 when (null mut) __IMPOSSIBLE__
-                names <- anyDefs mut =<< normalise (map (snd . unDom) tel', core)
+                names <- anyDefs (mut `hasElem`) (map (snd . unDom) tel', core)
                 reportSDoc "term.guardedness" 40 $
-                  text "found" <+> if null names then text "none" else sep (map prettyTCM names)
+                  "found" <+> if null names then "none" else sep (map prettyTCM $ Set.toList names)
                 return $ not $ null names
       _ -> do
         reportSLn "term.guardedness" 40 $ prettyShow q ++ " is not a proper projection"
@@ -507,7 +503,7 @@ patternDepth = getMaxNat . foldrPattern depth where
 --   for structural descent.
 
 unusedVar :: DeBruijnPattern
-unusedVar = LitP (LitString noRange "term.unused.pat.var")
+unusedVar = litP (LitString "term.unused.pat.var")
 
 -- | Extract variables from 'DeBruijnPattern's that could witness a decrease
 --   via a SIZELT constraint.
@@ -527,6 +523,8 @@ instance UsableSizeVars DeBruijnPattern where
     LitP{}     -> none
     DotP{}     -> none
     ProjP{}    -> none
+    IApplyP{}  -> none
+    DefP{} -> none
     where none _ = return mempty
 
 instance UsableSizeVars [DeBruijnPattern] where
@@ -544,6 +542,8 @@ instance UsableSizeVars (Masked DeBruijnPattern) where
     LitP{}     -> none
     DotP{}     -> none
     ProjP{}    -> none
+    IApplyP{}  -> none
+    DefP{}     -> none
     where none _ = return mempty
 
 instance UsableSizeVars MaskedDeBruijnPatterns where
@@ -578,7 +578,11 @@ instance PrettyTCM a => PrettyTCM (Masked a) where
 
 -- * Call pathes
 
--- | The call information is stored as free monoid
+-- | Call paths.
+
+-- An old comment:
+--
+--   The call information is stored as free monoid
 --   over 'CallInfo'.  As long as we never look at it,
 --   only accumulate it, it does not matter whether we use
 --   'Set', (nub) list, or 'Tree'.
@@ -587,33 +591,48 @@ instance PrettyTCM a => PrettyTCM (Masked a) where
 --   Since we define no order on 'CallInfo' (expensive),
 --   we cannot use a 'Set' or nub list.
 --   Performance-wise, I could not see a difference between Set and list.
+--
+-- If the binary tree is balanced "incorrectly", then forcing it could
+-- be expensive, so a switch was made to difference lists.
 
-newtype CallPath = CallPath { callInfos :: [CallInfo] }
-  deriving (Show, Semigroup, Monoid, AllNames)
+newtype CallPath = CallPath (DList CallInfo)
+  deriving (Show, Semigroup, Monoid)
+
+-- | The calls making up the call path.
+
+callInfos :: CallPath -> [CallInfo]
+callInfos (CallPath cs) = DL.toList cs
 
 -- | Only show intermediate nodes.  (Drop last 'CallInfo').
 instance Pretty CallPath where
-  pretty (CallPath cis0) = if null cis then empty else
+  pretty cis0 = if null cis then empty else
     P.hsep (map (\ ci -> arrow P.<+> P.pretty ci) cis) P.<+> arrow
     where
-      cis   = init cis0
-      arrow = P.text "-->"
+      cis   = init (callInfos cis0)
+      arrow = "-->"
 
 -- * Size depth estimation
 
 -- | A very crude way of estimating the @SIZELT@ chains
 --   @i > j > k@ in context.  Returns 3 in this case.
 --   Overapproximates.
+class TerSetSizeDepth b where
+  terSetSizeDepth :: b -> TerM a -> TerM a
+
+instance TerSetSizeDepth Telescope where
+  terSetSizeDepth = terSetSizeDepth . telToList
 
 -- TODO: more precise analysis, constructing a tree
 -- of relations between size variables.
-terSetSizeDepth :: Telescope -> TerM a -> TerM a
-terSetSizeDepth tel cont = do
-  n <- liftTCM $ sum <$> do
-    forM (telToList tel) $ \ dom -> do
-      a <- reduce $ snd $ unDom dom
-      ifM (isJust <$> isSizeType a) (return 1) {- else -} $
-        case unEl a of
-          MetaV{} -> return 1
-          _       -> return 0
-  terLocal (set terSizeDepth n) cont
+instance TerSetSizeDepth ListTel where
+  terSetSizeDepth doms cont = do
+    n <- liftTCM $ sum <$> do
+      forM doms $ \ dom -> do
+        -- Andreas, 2022-03-12, TODO:
+        -- use ifBlocked?  Shouldn't blocked types be treated like metas?
+        a <- reduce $ snd $ unDom dom
+        ifM (isJust <$> isSizeType a) (return 1) {- else -} $
+          case unEl a of
+            MetaV{} -> return 1
+            _       -> return 0
+    terLocal (set terSizeDepth n) cont

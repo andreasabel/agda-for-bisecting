@@ -1,4 +1,4 @@
-{-# OPTIONS --without-K #-}
+{-# OPTIONS --cubical-compatible --safe --no-sized-types --no-guardedness #-}
 
 module Agda.Builtin.List where
 
@@ -9,7 +9,6 @@ data List {a} (A : Set a) : Set a where
 
 {-# BUILTIN LIST List #-}
 
-{-# COMPILE UHC List = data __LIST__ (__NIL__ | __CONS__) #-}
 {-# COMPILE JS  List = function(x,v) {
   if (x.length < 1) { return v["[]"](); } else { return v["_∷_"](x[0], x.slice(1)); }
 } #-}

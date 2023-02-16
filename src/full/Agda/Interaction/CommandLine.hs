@@ -1,18 +1,27 @@
-{-# LANGUAGE CPP #-}
 
-module Agda.Interaction.CommandLine where
+module Agda.Interaction.CommandLine
+  ( runInteractionLoop
+  ) where
 
+import Control.Monad
+import Control.Monad.Except
+import Control.Monad.IO.Class ( MonadIO(..) )
+import Control.Monad.State
 import Control.Monad.Reader
 
 import qualified Data.List as List
 import Data.Maybe
 
+import Text.Read (readMaybe)
+
+import Agda.Interaction.Base hiding (Command)
 import Agda.Interaction.BasicOps as BasicOps hiding (parseExpr)
+import Agda.Interaction.Imports ( CheckResult, crInterface )
 import Agda.Interaction.Monad
 
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Common
-import Agda.Syntax.Internal (telToList)
+import Agda.Syntax.Internal (telToList, alwaysUnblock)
 import qualified Agda.Syntax.Internal as I
 import Agda.Syntax.Parser
 import Agda.Syntax.Position
@@ -20,9 +29,6 @@ import Agda.Syntax.Scope.Base
 import Agda.Syntax.Translation.ConcreteToAbstract
 import Agda.Syntax.Abstract.Pretty
 
-import Text.PrettyPrint
-
-import Agda.TheTypeChecker
 import Agda.TypeChecking.Constraints
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Reduce
@@ -31,23 +37,52 @@ import Agda.TypeChecking.Pretty ( PrettyTCM(prettyTCM) )
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Warnings (runPM)
 
-import Agda.Utils.Except ( MonadError(catchError) )
-import Agda.Utils.Monad
+import Agda.Utils.FileName (absolute, AbsolutePath)
+import Agda.Utils.Maybe (caseMaybeM)
+import Agda.Utils.Pretty
 
-#include "undefined.h"
 import Agda.Utils.Impossible
+
+data ReplEnv = ReplEnv
+    { replSetupAction     :: TCM ()
+    , replTypeCheckAction :: AbsolutePath -> TCM CheckResult
+    }
+
+data ReplState = ReplState
+    { currentFile :: Maybe AbsolutePath
+    }
+
+newtype ReplM a = ReplM { unReplM :: ReaderT ReplEnv (StateT ReplState IM) a }
+    deriving
+    ( Functor, Applicative, Monad, MonadIO
+    , HasOptions, MonadTCEnv, ReadTCState, MonadTCState, MonadTCM
+    , MonadError TCErr
+    , MonadReader ReplEnv, MonadState ReplState
+    )
+
+runReplM :: Maybe AbsolutePath -> TCM () -> (AbsolutePath -> TCM CheckResult) -> ReplM () -> TCM ()
+runReplM initialFile setup checkInterface
+    = runIM
+    . flip evalStateT (ReplState initialFile)
+    . flip runReaderT replEnv
+    . unReplM
+  where
+  replEnv = ReplEnv
+    { replSetupAction     = setup
+    , replTypeCheckAction = checkInterface
+    }
 
 data ExitCode a = Continue | ContinueIn TCEnv | Return a
 
-type Command a = (String, [String] -> TCM (ExitCode a))
+type Command a = (String, [String] -> ReplM (ExitCode a))
 
-matchCommand :: String -> [Command a] -> Either [String] ([String] -> TCM (ExitCode a))
+matchCommand :: String -> [Command a] -> Either [String] ([String] -> ReplM (ExitCode a))
 matchCommand x cmds =
     case List.filter (List.isPrefixOf x . fst) cmds of
         [(_,m)] -> Right m
         xs      -> Left $ List.map fst xs
 
-interaction :: String -> [Command a] -> (String -> TCM (ExitCode a)) -> IM a
+interaction :: String -> [Command a] -> (String -> TCM (ExitCode a)) -> ReplM a
 interaction prompt cmds eval = loop
     where
         go (Return x)       = return x
@@ -55,43 +90,57 @@ interaction prompt cmds eval = loop
         go (ContinueIn env) = localTC (const env) loop
 
         loop =
-            do  ms <- readline prompt
+            do  ms <- ReplM $ lift $ lift $ readline prompt
                 case fmap words ms of
                     Nothing               -> return $ error "** EOF **"
                     Just []               -> loop
                     Just ((':':cmd):args) ->
                         do  case matchCommand cmd cmds of
-                                Right c -> go =<< liftTCM (c args)
+                                Right c -> go =<< (c args)
                                 Left [] ->
                                     do  liftIO $ putStrLn $ "Unknown command '" ++ cmd ++ "'"
                                         loop
                                 Left xs ->
-                                    do  liftIO $ putStrLn $ "More than one command match: " ++ concat (List.intersperse ", " xs)
+                                    do  liftIO $ putStrLn $ "More than one command match: " ++
+                                                            List.intercalate ", " xs
                                         loop
                     Just _ ->
                         do  go =<< liftTCM (eval $ fromJust ms)
             `catchError` \e ->
-                do  s <- liftTCM $ prettyError e
+                do  s <- prettyError e
                     liftIO $ putStrLn s
                     loop
 
+runInteractionLoop :: Maybe AbsolutePath -> TCM () -> (AbsolutePath -> TCM CheckResult) -> TCM ()
+runInteractionLoop initialFile setup check = runReplM initialFile setup check interactionLoop
+
+replSetup :: ReplM ()
+replSetup = do
+    liftTCM =<< asks replSetupAction
+    liftIO $ putStr splashScreen
+
+checkCurrentFile :: ReplM (Maybe CheckResult)
+checkCurrentFile = traverse checkFile =<< gets currentFile
+
+checkFile :: AbsolutePath -> ReplM CheckResult
+checkFile file = liftTCM . ($ file) =<< asks replTypeCheckAction
+
 -- | The interaction loop.
-interactionLoop :: TCM (Maybe Interface) -> IM ()
-interactionLoop doTypeCheck =
-    do  liftTCM reload
-        interaction "Main> " commands evalTerm
+interactionLoop :: ReplM ()
+interactionLoop = do
+    -- Run the setup action
+    replSetup
+    reload
+    interaction "Main> " commands evalTerm
     where
-        reload = do
-            mi <- doTypeCheck
-            -- Note that mi is Nothing if (1) there is no input file or
-            -- (2) the file type checked with unsolved metas and
-            -- --allow-unsolved-metas was used. In the latter case the
-            -- behaviour of agda -I may be surprising. If agda -I ever
-            -- becomes properly supported again, then this behaviour
-            -- should perhaps be fixed.
-            setScope $ case mi of
-              Just i  -> iInsideScope i
-              Nothing -> emptyScopeInfo
+        reload :: ReplM () = do
+            checked <- checkCurrentFile
+            liftTCM $ setScope $ maybe emptyScopeInfo iInsideScope (crInterface <$> checked)
+            -- Andreas, 2021-01-27, issue #5132, make Set and Prop available from Agda.Primitive
+            -- if no module is loaded.
+            when (isNothing checked) $ do
+              -- @open import Agda.Primitive using (Set; Prop)@
+              void $ liftTCM importPrimitives
           `catchError` \e -> do
             s <- prettyError e
             liftIO $ putStrLn s
@@ -102,41 +151,42 @@ interactionLoop doTypeCheck =
             , "?"           |>  \_ -> continueAfter $ liftIO $ help commands
             , "reload"      |>  \_ -> do reload
                                          ContinueIn <$> askTC
-            , "constraints" |> \args -> continueAfter $ showConstraints args
-            , "Context"     |> \args -> continueAfter $ showContext args
-            , "give"        |> \args -> continueAfter $ giveMeta args
-            , "Refine"      |> \args -> continueAfter $ refineMeta args
-            , "metas"       |> \args -> continueAfter $ showMetas args
+            , "constraints" |> \args -> continueAfter $ liftTCM $ showConstraints args
+            , "Context"     |> \args -> continueAfter $ liftTCM $ showContext args
+            , "give"        |> \args -> continueAfter $ liftTCM $ giveMeta args
+            , "Refine"      |> \args -> continueAfter $ liftTCM $ refineMeta args
+            , "metas"       |> \args -> continueAfter $ liftTCM $ showMetas args
             , "load"        |> \args -> continueAfter $ loadFile reload args
-            , "eval"        |> \args -> continueAfter $ evalIn args
-            , "typeOf"      |> \args -> continueAfter $ typeOf args
-            , "typeIn"      |> \args -> continueAfter $ typeIn args
-            , "wakeup"      |> \_ -> continueAfter $ retryConstraints
-            , "scope"       |> \_ -> continueAfter $ showScope
+            , "eval"        |> \args -> continueAfter $ liftTCM $ evalIn args
+            , "typeOf"      |> \args -> continueAfter $ liftTCM $ typeOf args
+            , "typeIn"      |> \args -> continueAfter $ liftTCM $ typeIn args
+            , "wakeup"      |> \_ -> continueAfter $ liftTCM $ retryConstraints
+            , "scope"       |> \_ -> continueAfter $ liftTCM $ showScope
             ]
             where
                 (|>) = (,)
 
-continueAfter :: TCM a -> TCM (ExitCode b)
+continueAfter :: ReplM a -> ReplM (ExitCode b)
 continueAfter m = withCurrentFile $ do
   m >> return Continue
 
--- | Set 'envCurrentPath' to 'optInputFile'.
-withCurrentFile :: TCM a -> TCM a
+-- | Set 'envCurrentPath' to the repl's current file
+withCurrentFile :: ReplM a -> ReplM a
 withCurrentFile cont = do
-  mpath <- getInputFile'
+  mpath <- gets currentFile
   localTC (\ e -> e { envCurrentPath = mpath }) cont
 
-loadFile :: TCM () -> [String] -> TCM ()
+loadFile :: ReplM () -> [String] -> ReplM ()
 loadFile reload [file] = do
-  setInputFile file
+  absPath <- liftIO $ absolute file
+  modify (\(ReplState _prevFile) -> ReplState (Just absPath))
   withCurrentFile reload
 loadFile _ _ = liftIO $ putStrLn ":load file"
 
 showConstraints :: [String] -> TCM ()
 showConstraints [] =
     do  cs <- BasicOps.getConstraints
-        liftIO $ putStrLn $ unlines (List.map show cs)
+        liftIO $ putStrLn $ unlines (List.map prettyShow cs)
 showConstraints _ = liftIO $ putStrLn ":constraints [cid]"
 
 
@@ -146,22 +196,22 @@ showMetas [m] =
         withInteractionId i $ do
           s <- typeOfMeta AsIs i
           r <- getInteractionRange i
-          d <- showA s
-          liftIO $ putStrLn $ d ++ " " ++ show r
+          d <- prettyA s
+          liftIO $ putStrLn $ render d ++ " " ++ prettyShow r
 showMetas [m,"normal"] =
     do  i <- InteractionId <$> readM m
         withInteractionId i $ do
-          s <- showA =<< typeOfMeta Normalised i
+          s <- prettyA =<< typeOfMeta Normalised i
           r <- getInteractionRange i
-          liftIO $ putStrLn $ s ++ " " ++ show r
+          liftIO $ putStrLn $ render s ++ " " ++ prettyShow r
 showMetas [] =
     do  interactionMetas <- typesOfVisibleMetas AsIs
         hiddenMetas      <- typesOfHiddenMetas  AsIs
-        mapM_ (liftIO . putStrLn) =<< mapM showII interactionMetas
+        mapM_ (liftIO . print) =<< mapM showII interactionMetas
         mapM_ print' hiddenMetas
     where
-        showII o = withInteractionId (outputFormId $ OutputForm noRange [] o) $ showA o
-        showM  o = withMetaId (nmid $ outputFormId $ OutputForm noRange [] o) $ showA o
+        showII o = withInteractionId (outputFormId $ OutputForm noRange [] alwaysUnblock o) $ prettyA o
+        showM  o = withMetaId (nmid $ outputFormId $ OutputForm noRange [] alwaysUnblock o) $ prettyA o
 
         metaId (OfType i _) = i
         metaId (JustType i) = i
@@ -171,25 +221,24 @@ showMetas [] =
         print' x = do
             r <- getMetaRange $ nmid $ metaId x
             d <- showM x
-            liftIO $ putStrLn $ d ++ "  [ at " ++ show r ++ " ]"
+            liftIO $ putStrLn $ render d ++ "  [ at " ++ prettyShow r ++ " ]"
 showMetas _ = liftIO $ putStrLn $ ":meta [metaid]"
 
 
 showScope :: TCM ()
 showScope = do
   scope <- getScope
-  liftIO $ print scope
+  liftIO $ putStrLn $ prettyShow scope
 
 metaParseExpr ::  InteractionId -> String -> TCM A.Expr
 metaParseExpr ii s =
     do  m <- lookupInteractionId ii
-        scope <- getMetaScope <$> lookupMeta m
-        r <- getRange <$> lookupMeta m
-        --liftIO $ putStrLn $ show scope
-        let pos = case rStart r of
-                    Nothing  -> __IMPOSSIBLE__
-                    Just pos -> pos
-        e <- runPM $ parsePosString exprParser pos s
+        scope <- getMetaScope <$> lookupLocalMeta m
+        r <- getRange <$> lookupLocalMeta m
+        -- liftIO $ putStrLn $ prettyShow scope
+        let pos = fromMaybe __IMPOSSIBLE__ (rStart r)
+        (e, coh) <- runPM $ parsePosString exprParser pos s
+        checkCohesionAttributes coh
         concreteToAbstract scope e
 
 actOnMeta :: [String] -> (InteractionId -> A.Expr -> TCM a) -> TCM a
@@ -218,33 +267,28 @@ refineMeta _ = liftIO $ putStrLn $ ": refine" ++ " metaid expr"
 
 
 retryConstraints :: TCM ()
-retryConstraints = liftTCM wakeupConstraints_
+retryConstraints = wakeupConstraints_
 
 
 evalIn :: [String] -> TCM ()
 evalIn s | length s >= 2 =
-    do  d <- actOnMeta s $ \_ e -> prettyA =<< evalInCurrent e
+    do  d <- actOnMeta s $ \_ e -> prettyA =<< evalInCurrent DefaultCompute e
         liftIO $ print d
 evalIn _ = liftIO $ putStrLn ":eval metaid expr"
 
 parseExpr :: String -> TCM A.Expr
 parseExpr s = do
-    e <- runPM $ parse exprParser s
+    (e, coh) <- runPM $ parse exprParser s
+    checkCohesionAttributes coh
     localToAbstract e return
 
 evalTerm :: String -> TCM (ExitCode a)
 evalTerm s =
     do  e <- parseExpr s
-        v <- evalInCurrent e
+        v <- evalInCurrent DefaultCompute e
         e <- prettyTCM v
-        liftIO $ putStrLn $ show e
+        liftIO $ print e
         return Continue
-    where
-        evalInCurrent e = do
-          (v,t) <- inferExpr e
-          v'    <- normalise v
-          return v'
-
 
 typeOf :: [String] -> TCM ()
 typeOf s =
@@ -264,9 +308,9 @@ typeIn _ = liftIO $ putStrLn ":typeIn meta expr"
 showContext :: [String] -> TCM ()
 showContext (meta:args) = do
     i <- InteractionId <$> readM meta
-    mi <- lookupMeta =<< lookupInteractionId i
+    mi <- lookupLocalMeta =<< lookupInteractionId i
     withMetaInfo (getMetaInfo mi) $ do
-      ctx <- List.map unDom . telToList <$> getContextTelescope
+      ctx <- List.map I.unDom . telToList <$> getContextTelescope
       zipWithM_ display ctx $ reverse $ zipWith const [1..] ctx
     where
         display (x, t) n = do
@@ -274,7 +318,7 @@ showContext (meta:args) = do
                     ["normal"] -> normalise $ raise n t
                     _          -> return $ raise n t
             d <- prettyTCM t
-            liftIO $ print $ text (I.argNameToString x) <+> text ":" <+> d
+            liftIO $ print $ text (argNameToString x) <+> ":" <+> d
 showContext _ = liftIO $ putStrLn ":Context meta"
 
 -- | The logo that prints when Agda is started in interactive mode.
@@ -301,3 +345,11 @@ help cs = putStr $ unlines $
     [ "<exp> Infer type of expression <exp> and evaluate it." ]
     where
         explain (x,_) = ":" ++ x
+
+-- Read -------------------------------------------------------------------
+
+readM :: Read a => String -> TCM a
+readM s = maybe err return $ readMaybe s
+  where
+  err    = throwError $ strMsg $ "Cannot parse: " ++ s
+  strMsg = Exception noRange . text

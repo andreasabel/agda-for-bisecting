@@ -1,54 +1,51 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE BangPatterns #-}
-
 -- | Lenses for 'TCState' and more.
 
 module Agda.TypeChecking.Monad.State where
 
-import Control.Arrow (first)
+
 import qualified Control.Exception as E
-import Control.Monad.Reader (asks)
-import Control.Monad.State (put, get, gets, modify, modify')
-import Control.Monad.Trans (liftIO)
+
+import Control.Monad       (void, when)
+import Control.Monad.Trans (MonadIO, liftIO)
 
 import Data.Maybe
-import Data.Map (Map)
+
 import qualified Data.Map as Map
-import Data.Monoid
+
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Traversable (traverse)
+import qualified Data.HashMap.Strict as HMap
 
 import Agda.Benchmarking
 
--- import {-# SOURCE #-} Agda.Interaction.Response
 import Agda.Interaction.Response
   (InteractionOutputCallback, Response)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Scope.Base
 import qualified Agda.Syntax.Concrete.Name as C
-import Agda.Syntax.Abstract (PatternSynDefn, PatternSynDefns, GeneralizableDefn, GeneralizableDefns)
+import Agda.Syntax.Abstract (PatternSynDefn, PatternSynDefns)
 import Agda.Syntax.Abstract.PatternSynonyms
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Internal
+import Agda.Syntax.Position
+import Agda.Syntax.TopLevelModuleName
 
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Warnings
-import {-# SOURCE #-} Agda.TypeChecking.Monad.Debug
-import {-# SOURCE #-} Agda.TypeChecking.Monad.Options
+
+import Agda.TypeChecking.Monad.Debug (reportSDoc, reportSLn, verboseS)
 import Agda.TypeChecking.Positivity.Occurrence
 import Agda.TypeChecking.CompiledClause
 
+import qualified Agda.Utils.BiMap as BiMap
 import Agda.Utils.Hash
-import qualified Agda.Utils.HashMap as HMap
 import Agda.Utils.Lens
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Monad (bracket_)
-import Agda.Utils.NonemptyList
 import Agda.Utils.Pretty
 import Agda.Utils.Tuple
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 -- | Resets the non-persistent part of the type checking state.
@@ -75,7 +72,7 @@ resetAllState = do
 --   In contrast to 'Agda.Utils.Monad.localState', the 'Benchmark'
 --   info from the subcomputation is saved.
 localTCState :: TCM a -> TCM a
-localTCState = disableDestructiveUpdate . bracket_ getTC (\ s -> do
+localTCState = bracket_ getTC (\ s -> do
    b <- getBenchmark
    putTC s
    modifyBenchmark $ const b)
@@ -92,6 +89,26 @@ localTCStateSaving compute = do
     putTC oldState
     modifyBenchmark $ const b
   return (result, newState)
+
+-- | Same as 'localTCState' but keep all warnings.
+localTCStateSavingWarnings :: TCM a -> TCM a
+localTCStateSavingWarnings compute = do
+  (result, newState) <- localTCStateSaving compute
+  modifyTC $ over stTCWarnings $ const $ newState ^. stTCWarnings
+  return result
+
+data SpeculateResult = SpeculateAbort | SpeculateCommit
+
+-- | Allow rolling back the state changes of a TCM computation.
+speculateTCState :: TCM (a, SpeculateResult) -> TCM a
+speculateTCState m = do
+  ((x, res), newState) <- localTCStateSaving m
+  case res of
+    SpeculateAbort  -> return x
+    SpeculateCommit -> x <$ putTC newState
+
+speculateTCState_ :: TCM SpeculateResult -> TCM ()
+speculateTCState_ m = void $ speculateTCState $ ((),) <$> m
 
 -- | A fresh TCM instance.
 --
@@ -148,33 +165,35 @@ lensAccumStatistics =  lensPersistentState . lensAccumStatisticsP
 ---------------------------------------------------------------------------
 
 -- | Get the current scope.
-getScope :: TCM ScopeInfo
-getScope = useTC stScope
+getScope :: ReadTCState m => m ScopeInfo
+getScope = useR stScope
 
 -- | Set the current scope.
 setScope :: ScopeInfo -> TCM ()
 setScope scope = modifyScope (const scope)
 
 -- | Modify the current scope without updating the inverse maps.
-modifyScope_ :: (ScopeInfo -> ScopeInfo) -> TCM ()
+modifyScope_ :: MonadTCState m => (ScopeInfo -> ScopeInfo) -> m ()
 modifyScope_ f = stScope `modifyTCLens` f
 
 -- | Modify the current scope.
-modifyScope :: (ScopeInfo -> ScopeInfo) -> TCM ()
+modifyScope :: MonadTCState m => (ScopeInfo -> ScopeInfo) -> m ()
 modifyScope f = modifyScope_ (recomputeInverseScopeMaps . f)
 
+-- | Get a part of the current scope.
+useScope :: ReadTCState m => Lens' a ScopeInfo -> m a
+useScope l = useR $ stScope . l
+
+-- | Run a computation in a modified scope.
+locallyScope :: ReadTCState m => Lens' a ScopeInfo -> (a -> a) -> m b -> m b
+locallyScope l = locallyTCState $ stScope . l
+
 -- | Run a computation in a local scope.
-withScope :: ScopeInfo -> TCM a -> TCM (a, ScopeInfo)
-withScope s m = do
-  s' <- getScope
-  setScope s
-  x   <- m
-  s'' <- getScope
-  setScope s'
-  return (x, s'')
+withScope :: ReadTCState m => ScopeInfo -> m a -> m (a, ScopeInfo)
+withScope s m = locallyTCState stScope (recomputeInverseScopeMaps . const s) $ (,) <$> m <*> getScope
 
 -- | Same as 'withScope', but discard the scope from the computation.
-withScope_ :: ScopeInfo -> TCM a -> TCM a
+withScope_ :: ReadTCState m => ScopeInfo -> m a -> m a
 withScope_ s m = fst <$> withScope s m
 
 -- | Discard any changes to the scope by a computation.
@@ -186,10 +205,15 @@ localScope m = do
   return x
 
 -- | Scope error.
-notInScope :: C.QName -> TCM a
-notInScope x = do
+notInScopeError :: C.QName -> TCM a
+notInScopeError x = do
   printScope "unbound" 5 ""
   typeError $ NotInScope [x]
+
+notInScopeWarning :: C.QName -> TCM ()
+notInScopeWarning x = do
+  printScope "unbound" 5 ""
+  warning $ NotInScopeW [x]
 
 -- | Debug print the scope.
 printScope :: String -> Int -> String -> TCM ()
@@ -203,29 +227,29 @@ printScope tag v s = verboseS ("scope." ++ tag) v $ do
 
 -- ** Lens for 'stSignature' and 'stImports'
 
-modifySignature :: (Signature -> Signature) -> TCM ()
+modifySignature :: MonadTCState m => (Signature -> Signature) -> m ()
 modifySignature f = stSignature `modifyTCLens` f
 
-modifyImportedSignature :: (Signature -> Signature) -> TCM ()
+modifyImportedSignature :: MonadTCState m => (Signature -> Signature) -> m ()
 modifyImportedSignature f = stImports `modifyTCLens` f
 
-getSignature :: TCM Signature
-getSignature = useTC stSignature
+getSignature :: ReadTCState m => m Signature
+getSignature = useR stSignature
 
 -- | Update a possibly imported definition. Warning: changes made to imported
 --   definitions (during type checking) will not persist outside the current
 --   module. This function is currently used to update the compiled
 --   representation of a function during compilation.
-modifyGlobalDefinition :: QName -> (Definition -> Definition) -> TCM ()
+modifyGlobalDefinition :: MonadTCState m => QName -> (Definition -> Definition) -> m ()
 modifyGlobalDefinition q f = do
   modifySignature         $ updateDefinition q f
   modifyImportedSignature $ updateDefinition q f
 
-setSignature :: Signature -> TCM ()
+setSignature :: MonadTCState m => Signature -> m ()
 setSignature sig = modifySignature $ const sig
 
 -- | Run some computation in a different signature, restore original signature.
-withSignature :: Signature -> TCM a -> TCM a
+withSignature :: (ReadTCState m, MonadTCState m) => Signature -> m a -> m a
 withSignature sig m = do
   sig0 <- getSignature
   setSignature sig
@@ -236,14 +260,23 @@ withSignature sig m = do
 -- ** Modifiers for rewrite rules
 addRewriteRulesFor :: QName -> RewriteRules -> [QName] -> Signature -> Signature
 addRewriteRulesFor f rews matchables =
-    (over sigRewriteRules $ HMap.insertWith mappend f rews)
-  . (updateDefinition f $ updateTheDef setNotInjective)
-  . (foldr (.) id $ map (\g -> updateDefinition g setMatchable) matchables)
+    over sigRewriteRules (HMap.insertWith mappend f rews)
+  . updateDefinition f (updateTheDef setNotInjective . setCopatternLHS)
+  . (setMatchableSymbols f matchables)
     where
       setNotInjective def@Function{} = def { funInv = NotInjective }
       setNotInjective def            = def
 
-      setMatchable def = def { defMatchable = True }
+      setCopatternLHS =
+        updateDefCopatternLHS (|| any hasProjectionPattern rews)
+
+      hasProjectionPattern rew = any (isJust . isProjElim) $ rewPats rew
+
+setMatchableSymbols :: QName -> [QName] -> Signature -> Signature
+setMatchableSymbols f matchables =
+  foldr ((.) . (\g -> updateDefinition g setMatchable)) id matchables
+    where
+      setMatchable def = def { defMatchable = Set.insert f $ defMatchable def }
 
 -- ** Modifiers for parts of the signature
 
@@ -278,36 +311,94 @@ updateFunClauses :: ([Clause] -> [Clause]) -> (Defn -> Defn)
 updateFunClauses f def@Function{ funClauses = cs} = def { funClauses = f cs }
 updateFunClauses f _                              = __IMPOSSIBLE__
 
+updateCovering :: ([Clause] -> [Clause]) -> (Defn -> Defn)
+updateCovering f def@Function{ funCovering = cs} = def { funCovering = f cs }
+updateCovering f _                               = __IMPOSSIBLE__
+
 updateCompiledClauses :: (Maybe CompiledClauses -> Maybe CompiledClauses) -> (Defn -> Defn)
 updateCompiledClauses f def@Function{ funCompiled = cc} = def { funCompiled = f cc }
 updateCompiledClauses f _                              = __IMPOSSIBLE__
 
-updateFunCopatternLHS :: (Bool -> Bool) -> Defn -> Defn
-updateFunCopatternLHS f def@Function{ funCopatternLHS = b } = def { funCopatternLHS = f b }
-updateFunCopatternLHS f _ = __IMPOSSIBLE__
+updateDefCopatternLHS :: (Bool -> Bool) -> Definition -> Definition
+updateDefCopatternLHS f def@Defn{ defCopatternLHS = b } = def { defCopatternLHS = f b }
+
+updateDefBlocked :: (Blocked_ -> Blocked_) -> Definition -> Definition
+updateDefBlocked f def@Defn{ defBlocked = b } = def { defBlocked = f b }
 
 ---------------------------------------------------------------------------
 -- * Top level module
 ---------------------------------------------------------------------------
 
+-- | Tries to convert a raw top-level module name to a top-level
+-- module name.
+
+topLevelModuleName :: RawTopLevelModuleName -> TCM TopLevelModuleName
+topLevelModuleName raw = do
+  hash <- BiMap.lookup raw <$> useR stTopLevelModuleNames
+  case hash of
+    Just hash -> return (unsafeTopLevelModuleName raw hash)
+    Nothing   -> do
+      let hash = hashRawTopLevelModuleName raw
+      when (hash == noModuleNameHash) $ typeError $ GenericError $
+        "The module name " ++ prettyShow raw ++ " has a reserved " ++
+        "hash (you may want to consider renaming the module with " ++
+        "this name)"
+      raw' <- BiMap.invLookup hash <$> useR stTopLevelModuleNames
+      case raw' of
+        Just raw' -> typeError $ GenericError $
+          "Module name hash collision for " ++ prettyShow raw ++
+          " and " ++ prettyShow raw' ++ " (you may want to consider " ++
+          "renaming one of these modules)"
+        Nothing -> do
+          stTopLevelModuleNames `modifyTCLens'`
+            BiMap.insert (killRange raw) hash
+          return (unsafeTopLevelModuleName raw hash)
+
 -- | Set the top-level module. This affects the global module id of freshly
 --   generated names.
 
--- TODO: Is the hash-function collision-free? If not, then the
--- implementation of 'setTopLevelModule' should be changed.
+setTopLevelModule :: TopLevelModuleName -> TCM ()
+setTopLevelModule top = do
+  let hash = moduleNameId top
+  stFreshNameId `setTCLens'` NameId 0 hash
+  stFreshMetaId `setTCLens'`
+    MetaId { metaId     = 0
+           , metaModule = hash
+           }
 
-setTopLevelModule :: C.QName -> TCM ()
-setTopLevelModule x = stFreshNameId `setTCLens` NameId 0 (hashString $ prettyShow x)
+-- | The name of the current top-level module, if any.
+{-# SPECIALIZE
+    currentTopLevelModule :: TCM (Maybe TopLevelModuleName) #-}
+{-# SPECIALIZE
+    currentTopLevelModule :: ReduceM (Maybe TopLevelModuleName) #-}
+currentTopLevelModule ::
+  (MonadTCEnv m, ReadTCState m) => m (Maybe TopLevelModuleName)
+currentTopLevelModule = do
+  m <- useR stCurrentModule
+  case m of
+    Just (_, top) -> return (Just top)
+    Nothing       -> do
+      p <- asksTC envImportPath
+      return $ case p of
+        top : _ -> Just top
+        []      -> Nothing
 
 -- | Use a different top-level module for a computation. Used when generating
 --   names for imported modules.
-withTopLevelModule :: C.QName -> TCM a -> TCM a
+withTopLevelModule :: TopLevelModuleName -> TCM a -> TCM a
 withTopLevelModule x m = do
-  next <- useTC stFreshNameId
+  nextN <- useTC stFreshNameId
+  nextM <- useTC stFreshMetaId
   setTopLevelModule x
   y <- m
-  stFreshNameId `setTCLens` next
+  stFreshMetaId `setTCLens` nextM
+  stFreshNameId `setTCLens` nextN
   return y
+
+currentModuleNameHash :: ReadTCState m => m ModuleNameHash
+currentModuleNameHash = do
+  NameId _ h <- useTC stFreshNameId
+  return h
 
 ---------------------------------------------------------------------------
 -- * Foreign code
@@ -319,38 +410,10 @@ addForeignCode backend code = do
   modifyTCLens (stForeignCode . key backend) $ Just . (ForeignCode r code :) . fromMaybe []
 
 ---------------------------------------------------------------------------
--- * Temporary: Haskell imports
---   These will go away when we remove the IMPORT and HASKELL pragmas in
---   favour of the FOREIGN pragma.
----------------------------------------------------------------------------
-
-addDeprecatedForeignCode :: String -> BackendName -> String -> TCM ()
-addDeprecatedForeignCode old backend code = do
-  warning $ DeprecationWarning (unwords ["The", old, "pragma"])
-                               foreignPragma "2.6"
-  addForeignCode backend code
-  where
-    spc | length (lines code) > 1 = "\n"
-        | otherwise               = " "
-    foreignPragma =
-      "{-# FOREIGN " ++ backend ++ spc ++ code ++ spc ++ "#-}"
-
--- | Tell the compiler to import the given Haskell module.
-addHaskellImport :: String -> TCM ()
-addHaskellImport i = addDeprecatedForeignCode "IMPORT" ghcBackendName $ "import qualified " ++ i
-
--- | Tell the compiler to import the given Haskell module.
-addHaskellImportUHC :: String -> TCM ()
-addHaskellImportUHC i = addDeprecatedForeignCode "IMPORT_UHC" ghcBackendName $ "__IMPORT__ " ++ i
-
-addInlineHaskell :: String -> TCM ()
-addInlineHaskell s = addDeprecatedForeignCode "HASKELL" ghcBackendName s
-
----------------------------------------------------------------------------
 -- * Interaction output callback
 ---------------------------------------------------------------------------
 
-getInteractionOutputCallback :: TCM InteractionOutputCallback
+getInteractionOutputCallback :: ReadTCState m => m InteractionOutputCallback
 getInteractionOutputCallback
   = getsTC $ stInteractionOutputCallback . stPersistentState
 
@@ -366,8 +429,8 @@ setInteractionOutputCallback cb
 -- * Pattern synonyms
 ---------------------------------------------------------------------------
 
-getPatternSyns :: TCM PatternSynDefns
-getPatternSyns = useTC stPatternSyns
+getPatternSyns :: ReadTCState m => m PatternSynDefns
+getPatternSyns = useR stPatternSyns
 
 setPatternSyns :: PatternSynDefns -> TCM ()
 setPatternSyns m = modifyPatternSyns (const m)
@@ -376,11 +439,11 @@ setPatternSyns m = modifyPatternSyns (const m)
 modifyPatternSyns :: (PatternSynDefns -> PatternSynDefns) -> TCM ()
 modifyPatternSyns f = stPatternSyns `modifyTCLens` f
 
-getPatternSynImports :: TCM PatternSynDefns
-getPatternSynImports = useTC stPatternSynImports
+getPatternSynImports :: ReadTCState m => m PatternSynDefns
+getPatternSynImports = useR stPatternSynImports
 
 -- | Get both local and imported pattern synonyms
-getAllPatternSyns :: TCM PatternSynDefns
+getAllPatternSyns :: ReadTCState m => m PatternSynDefns
 getAllPatternSyns = Map.union <$> getPatternSyns <*> getPatternSynImports
 
 lookupPatternSyn :: AmbiguousQName -> TCM PatternSynDefn
@@ -388,7 +451,7 @@ lookupPatternSyn (AmbQ xs) = do
   defs <- traverse lookupSinglePatternSyn xs
   case mergePatternSynDefs defs of
     Just def   -> return def
-    Nothing    -> typeError $ CannotResolveAmbiguousPatternSynonym (zipNe xs defs)
+    Nothing    -> typeError $ CannotResolveAmbiguousPatternSynonym $ List1.zip xs defs
 
 lookupSinglePatternSyn :: QName -> TCM PatternSynDefn
 lookupSinglePatternSyn x = do
@@ -399,7 +462,7 @@ lookupSinglePatternSyn x = do
             si <- getPatternSynImports
             case Map.lookup x si of
                 Just d  -> return d
-                Nothing -> notInScope $ qnameToConcrete x
+                Nothing -> notInScopeError $ qnameToConcrete x
 
 ---------------------------------------------------------------------------
 -- * Benchmark

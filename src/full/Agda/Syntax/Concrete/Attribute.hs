@@ -1,6 +1,3 @@
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE LambdaCase    #-}
-{-# LANGUAGE ConstraintKinds #-}
 
 -- | Attributes: concrete syntax for ArgInfo, esp. modalities.
 
@@ -15,20 +12,52 @@ import qualified Data.Map as Map
 import Data.Maybe
 
 import Agda.Syntax.Common
-import Agda.Syntax.Concrete.Name
+import Agda.Syntax.Concrete (Expr(..))
+import Agda.Syntax.Concrete.Pretty () --instance only
+import Agda.Syntax.Position
 
--- import Agda.Utils.Functor
+import Agda.Utils.List1 (List1, pattern (:|))
+import Agda.Utils.Pretty (prettyShow)
+
+import Agda.Utils.Impossible
 
 -- | An attribute is a modifier for `ArgInfo`.
 
 data Attribute
   = RelevanceAttribute Relevance
   | QuantityAttribute  Quantity
-  deriving (Eq, Ord, Show)
+  | TacticAttribute Expr
+  | CohesionAttribute Cohesion
+  | LockAttribute      Lock
+  deriving (Show)
+
+instance HasRange Attribute where
+  getRange = \case
+    RelevanceAttribute r -> getRange r
+    QuantityAttribute q  -> getRange q
+    CohesionAttribute c  -> getRange c
+    TacticAttribute e    -> getRange e
+    LockAttribute l      -> NoRange
+
+instance SetRange Attribute where
+  setRange r = \case
+    RelevanceAttribute a -> RelevanceAttribute $ setRange r a
+    QuantityAttribute q  -> QuantityAttribute  $ setRange r q
+    CohesionAttribute c  -> CohesionAttribute  $ setRange r c
+    TacticAttribute e    -> TacticAttribute e  -- -- $ setRange r e -- SetRange Expr not yet implemented
+    LockAttribute l      -> LockAttribute l
+
+instance KillRange Attribute where
+  killRange = \case
+    RelevanceAttribute a -> RelevanceAttribute $ killRange a
+    QuantityAttribute q  -> QuantityAttribute  $ killRange q
+    CohesionAttribute c  -> CohesionAttribute  $ killRange c
+    TacticAttribute e    -> TacticAttribute    $ killRange e
+    LockAttribute l      -> LockAttribute l
 
 -- | (Conjunctive constraint.)
 
-type LensAttribute a = (LensRelevance a, LensQuantity a)
+type LensAttribute a = (LensRelevance a, LensQuantity a, LensCohesion a, LensLock a)
 
 -- | Modifiers for 'Relevance'.
 
@@ -42,19 +71,57 @@ relevanceAttributeTable = concat
 -- | Modifiers for 'Quantity'.
 
 quantityAttributeTable :: [(String, Quantity)]
-quantityAttributeTable = concat
-  [ map (, Quantity0) [ "0", "erased" ] -- , "static", "compile-time" ]
-  , map (, Quantityω) [ "ω", "plenty" ] -- , "dynamic", "runtime", "unrestricted", "abundant" ]
-  -- , map (, Quantity1)  [ "1", "linear" ]
-  -- , map (, Quantity01) [ "01", "affine" ]
+quantityAttributeTable =
+  [ ("0"      , Quantity0 $ Q0       noRange)
+  , ("erased" , Quantity0 $ Q0Erased noRange)
+  -- TODO: linearity
+  -- , ("1"      , Quantity1 $ Q1       noRange)
+  -- , ("linear" , Quantity1 $ Q1Linear noRange)
+  , ("ω"      , Quantityω $ Qω       noRange)
+  , ("plenty" , Quantityω $ QωPlenty noRange)
   ]
+-- quantityAttributeTable = concat
+--   [ map (, Quantity0) [ "0", "erased" ] -- , "static", "compile-time" ]
+--   , map (, Quantityω) [ "ω", "plenty" ] -- , "dynamic", "runtime", "unrestricted", "abundant" ]
+--   -- , map (, Quantity1)  [ "1", "linear" ]
+--   -- , map (, Quantity01) [ "01", "affine" ]
+--   ]
+
+cohesionAttributeTable :: [(String, Cohesion)]
+cohesionAttributeTable =
+  [ ("♭"    , Flat)
+  , ("flat" , Flat)
+  ]
+
+-- | Information about cohesion attributes (printed representations
+-- and positions).
+--
+-- This information is returned by the parser. Code that calls the
+-- parser should, if appropriate, complain if support for cohesion
+-- attributes has not been enabled and the returned list is non-empty.
+-- This can be taken care of by
+-- 'Agda.Syntax.Translation.ConcreteToAbstract.checkCohesionAttributes',
+-- which should not be called until after pragma options have been set.
+
+type CohesionAttributes = [(String, Range)]
+
+-- | Modifiers for 'Quantity'.
+
+lockAttributeTable :: [(String, Lock)]
+lockAttributeTable = concat
+  [ map (, IsNotLock) [ "notlock" ] -- default, shouldn't be used much
+  , map (, IsLock) [ "lock", "tick" ] -- 🔓
+  ]
+
 
 -- | Concrete syntax for all attributes.
 
 attributesMap :: Map String Attribute
-attributesMap = Map.fromList $ concat
+attributesMap = Map.fromListWith __IMPOSSIBLE__ $ concat
   [ map (second RelevanceAttribute) relevanceAttributeTable
   , map (second QuantityAttribute)  quantityAttributeTable
+  , map (second CohesionAttribute)  cohesionAttributeTable
+  , map (second LockAttribute)      lockAttributeTable
   ]
 
 -- | Parsing a string into an attribute.
@@ -62,12 +129,21 @@ attributesMap = Map.fromList $ concat
 stringToAttribute :: String -> Maybe Attribute
 stringToAttribute = (`Map.lookup` attributesMap)
 
+-- | Parsing an expression into an attribute.
+
+exprToAttribute :: Expr -> Maybe Attribute
+exprToAttribute (Paren _ (Tactic _ t)) = Just $ TacticAttribute t
+exprToAttribute e = setRange (getRange e) $ stringToAttribute $ prettyShow e
+
 -- | Setting an attribute (in e.g. an 'Arg').  Overwrites previous value.
 
 setAttribute :: (LensAttribute a) => Attribute -> a -> a
 setAttribute = \case
   RelevanceAttribute r -> setRelevance r
   QuantityAttribute  q -> setQuantity  q
+  CohesionAttribute  c -> setCohesion  c
+  LockAttribute      l -> setLock      l
+  TacticAttribute t    -> id
 
 
 -- | Setting some attributes in left-to-right order.
@@ -83,29 +159,46 @@ setAttributes attrs arg = foldl' (flip setAttribute) arg attrs
 
 -- | Setting 'Relevance' if unset.
 
-applyRelevance :: (LensRelevance a) => Relevance -> a -> Maybe a
-applyRelevance r a
+setPristineRelevance :: (LensRelevance a) => Relevance -> a -> Maybe a
+setPristineRelevance r a
   | getRelevance a == defaultRelevance = Just $ setRelevance r a
   | otherwise = Nothing
 
 -- | Setting 'Quantity' if unset.
 
-applyQuantity :: (LensQuantity a) => Quantity -> a -> Maybe a
-applyQuantity q a
-  | getQuantity a == defaultQuantity = Just $ setQuantity q a
+setPristineQuantity :: (LensQuantity a) => Quantity -> a -> Maybe a
+setPristineQuantity q a
+  | noUserQuantity a = Just $ setQuantity q a
   | otherwise = Nothing
 
--- | Applying an attribute (to e.g. an 'Arg').
+-- | Setting 'Cohesion' if unset.
 
-applyAttribute :: (LensAttribute a) => Attribute -> a -> Maybe a
-applyAttribute = \case
-  RelevanceAttribute r -> applyRelevance r
-  QuantityAttribute  q -> applyQuantity  q
+setPristineCohesion :: (LensCohesion a) => Cohesion -> a -> Maybe a
+setPristineCohesion c a
+  | getCohesion a == defaultCohesion = Just $ setCohesion c a
+  | otherwise = Nothing
 
--- | Applying a list of attributes.
+-- | Setting 'Lock' if unset.
 
-applyAttributes :: (LensAttribute a) => [Attribute] -> a -> Maybe a
-applyAttributes attrs arg = foldM (flip applyAttribute) arg attrs
+setPristineLock :: (LensLock a) => Lock -> a -> Maybe a
+setPristineLock q a
+  | getLock a == defaultLock = Just $ setLock q a
+  | otherwise = Nothing
+
+-- | Setting an unset attribute (to e.g. an 'Arg').
+
+setPristineAttribute :: (LensAttribute a) => Attribute -> a -> Maybe a
+setPristineAttribute = \case
+  RelevanceAttribute r -> setPristineRelevance r
+  QuantityAttribute  q -> setPristineQuantity  q
+  CohesionAttribute  c -> setPristineCohesion  c
+  LockAttribute      l -> setPristineLock      l
+  TacticAttribute{}    -> Just
+
+-- | Setting a list of unset attributes.
+
+setPristineAttributes :: (LensAttribute a) => [Attribute] -> a -> Maybe a
+setPristineAttributes attrs arg = foldM (flip setPristineAttribute) arg attrs
 
 ---------------------------------------------------------------------------
 -- * Filtering attributes
@@ -121,8 +214,15 @@ isQuantityAttribute = \case
   QuantityAttribute q -> Just q
   _ -> Nothing
 
+isTacticAttribute :: Attribute -> Maybe Expr
+isTacticAttribute (TacticAttribute t) = Just t
+isTacticAttribute _                   = Nothing
+
 relevanceAttributes :: [Attribute] -> [Attribute]
 relevanceAttributes = filter $ isJust . isRelevanceAttribute
 
 quantityAttributes :: [Attribute] -> [Attribute]
 quantityAttributes = filter $ isJust . isQuantityAttribute
+
+tacticAttributes :: [Attribute] -> [Attribute]
+tacticAttributes = filter $ isJust . isTacticAttribute

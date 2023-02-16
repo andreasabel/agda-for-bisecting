@@ -190,8 +190,6 @@ Limitations
 
 * Primitive functions are not supported.
 
-* Copatterns are not supported.
-
 * Termination checking for recursive calls is done locally, so a
   non-terminating set of clauses might be sent back to Agda.
 
@@ -207,9 +205,6 @@ Limitations
 
 * Case split mode sometimes gives a unnecessarily complex RHS for some
   clause when the solution consists of several clauses.
-
-* The special constraints that apply to ``codata`` are not respected
-  by Agsy. Agsy treats ``codata`` just like ``data``.
 
 * Agsy has universe subtyping, so sometimes suggests solutions not
   accepted by Agda.

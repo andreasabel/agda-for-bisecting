@@ -90,7 +90,8 @@ instance DeBruijn Tm where
   deBruijnView v = do VarT x <- pure v; pure x
   deBruijnVar x  = VarT x
 
-instance Subst Tm Tm where
+instance Subst Tm where
+  type SubstArg Tm = Tm
   applySubst rho v = case v of
     VarT x    -> lookupS rho x
     AnnT t v  -> AnnT t $ applySubst rho v
@@ -182,7 +183,7 @@ genSub delta = frequency $
     genCons delta t = do
       (gamma, rho) <- genSub delta
       case t of
-        X -> pure (gamma, Strengthen (error "str") rho)
+        X -> pure (gamma, strengthenS' (error "str") 1 rho)
         _ -> do
           v <- genTm gamma t
           pure (gamma, v :# rho)

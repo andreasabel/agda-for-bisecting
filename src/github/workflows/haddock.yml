@@ -1,0 +1,94 @@
+name: Haddock
+# Test documentation: haddock, user-manual.
+# Since `stack haddock` compiles Agda but `cabal haddock` does not,
+# we use cabal if we just want to build the haddockumentation [Issue #2188].
+on:
+  push:
+    branches:
+    - master
+    - ci-*
+    - release*
+    paths: &trigger_path_list
+    - 'src/full/**.hs'
+    - 'Agda.cabal'
+    - '.github/workflows/haddock.yml'
+  pull_request:
+    paths: *trigger_path_list
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        # Andreas, 2022-10-18
+        # Don't use 'latest' when you want the latest version,
+        # since this often does not point at the latest version;
+        # not for the virtual environments, and also haskell/action/setup
+        # is usually not up-to-date.
+        os: [ubuntu-22.04]
+        ghc-ver: ['9.4']
+        cabal-ver: ['3.8']
+
+    if: |
+      !contains(github.event.head_commit.message, '[skip ci]')
+      && !contains(github.event.head_commit.message, '[ci skip]')
+      && !contains(github.event.head_commit.message, '[github skip]')
+      && !contains(github.event.head_commit.message, '[skip github]')
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: haskell/actions/setup@v2
+      id: setup-haskell
+      with:
+        ghc-version: ${{ matrix.ghc-ver }}
+        cabal-version: ${{ matrix.cabal-ver }}
+
+    - name: Environment settings based on the Haskell setup
+      run: |
+        export GHC_VER=$(ghc --numeric-version)
+        export CABAL_VER=$(cabal --numeric-version)
+        echo "GHC_VER    = ${GHC_VER}"
+        echo "CABLAL_VER = ${CABAL_VER}"
+        echo "GHC_VER=${GHC_VER}"         >> ${GITHUB_ENV}
+        echo "CABAL_VER=${CABAL_VER}"     >> ${GITHUB_ENV}
+      # From now on, use env.{GHC|CABAL}_VER rather than matrix.{ghc|cabal}-ver!
+
+    - name: Resolve dependencies
+      run: |
+        cabal update
+        cabal configure -fenable-cluster-counting --enable-tests --disable-library-profiling
+
+    - uses: actions/cache@v3
+      name: Cache dependencies
+      id: cache
+      with:
+        path: |
+          ${{ steps.setup-haskell.outputs.cabal-store }}
+        # The file `plan.json` contains the build information.
+        key: ${{ runner.os }}-cabal-${{ env.GHC_VER }}-${{ env.CABAL_VER }}-${{ hashFiles('**/plan.json') }}
+
+    - name: Install dependencies
+      if: ${{ !steps.cache.outputs.cache-hit }}
+      run: |
+        cabal build --dependencies-only --force-reinstalls
+
+    # Testing Haddock [Issue 1773]
+    - name: Build Haddock
+      run: |
+        cabal haddock --haddock-html-location='https://hackage.haskell.org/package/$pkg-$version/docs' --haddock-hyperlink-source --haddock-quickjump
+
+    - name: Prepare to upload built htmls
+      run: |
+        find dist-newstyle -path '*/doc/html/Agda' -type d -exec cp -R {} html \;
+        ls -R html
+
+    - name: Deploy haddock
+      uses: peaceiris/actions-gh-pages@v3
+      if: github.ref == 'refs/heads/master'
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: html
+        force_orphan:  true
+        destination_dir: docs

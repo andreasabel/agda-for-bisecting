@@ -1,3 +1,5 @@
+{-# OPTIONS --cubical-compatible --safe --no-sized-types --no-guardedness #-}
+
 module Agda.Builtin.Sigma where
 
 open import Agda.Primitive
@@ -11,3 +13,5 @@ record Σ {a b} (A : Set a) (B : A → Set b) : Set (a ⊔ b) where
 open Σ public
 
 infixr 4 _,_
+
+{-# BUILTIN SIGMA Σ #-}

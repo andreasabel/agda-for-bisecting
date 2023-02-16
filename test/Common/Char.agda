@@ -1,3 +1,4 @@
+{-# OPTIONS --cubical-compatible #-}
 module Common.Char where
 
 open import Agda.Builtin.Char public

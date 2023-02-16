@@ -1,5 +1,3 @@
-{-# LANGUAGE CPP #-}
-
 ------------------------------------------------------------------------
 -- | Data type for all interactive responses
 ------------------------------------------------------------------------
@@ -9,24 +7,43 @@ module Agda.Interaction.Response
   , RemoveTokenBasedHighlighting (..)
   , MakeCaseVariant (..)
   , DisplayInfo (..)
+  , GoalDisplayInfo(..)
+  , Goals
+  , WarningsAndNonFatalErrors
+  , Info_Error(..)
+  , GoalTypeAux(..)
+  , ResponseContextEntry(..)
   , Status (..)
   , GiveResult (..)
   , InteractionOutputCallback
   , defaultInteractionOutputCallback
   ) where
 
+import Agda.Interaction.Base
+  ( CommandState
+  , CompilerBackend
+  , ComputeMode
+  , OutputConstraint
+  , OutputConstraint'
+  , OutputForm
+  , Rewrite
+  )
 import Agda.Interaction.Highlighting.Precise
+import qualified Agda.Syntax.Abstract as A
+import Agda.Syntax.Common         (InteractionId(..), Arg)
+import Agda.Syntax.Concrete       (Expr)
+import Agda.Syntax.Concrete.Name  (Name, QName, NameInScope)
+import Agda.Syntax.Scope.Base     (AbstractModule, AbstractName, LocalVar, WhyInScopeData)
+import qualified Agda.Syntax.Internal as I
 import {-# SOURCE #-} Agda.TypeChecking.Monad.Base
-import Agda.Syntax.Common   (InteractionId(..))
-import Agda.Syntax.Concrete (Expr)
-import Agda.Utils.Pretty
+  (TCM, TCErr, TCWarning, HighlightingMethod, ModuleToSource, NamedMeta, TCWarning, IPBoundary')
+import Agda.TypeChecking.Warnings (WarningsAndNonFatalErrors)
+import Agda.Utils.Impossible
+import Agda.Utils.Time
 
 import Control.Monad.Trans
 import Data.Int
 import System.IO
-
-#include "undefined.h"
-import Agda.Utils.Impossible
 
 -- | Responses for any interactive interface
 --
@@ -43,7 +60,8 @@ data Response
     | Resp_JumpToError FilePath Int32
     | Resp_InteractionPoints [InteractionId]
     | Resp_GiveAction InteractionId GiveResult
-    | Resp_MakeCase MakeCaseVariant [String]
+    | Resp_MakeCase InteractionId MakeCaseVariant [String]
+      -- ^ Response is list of printed clauses.
     | Resp_SolveAll [(InteractionId, Expr)]
       -- ^ Solution for one or more meta-variables.
     | Resp_DisplayInfo DisplayInfo
@@ -55,6 +73,9 @@ data Response
     | Resp_DoneAborting
       -- ^ A command sent when an abort command has completed
       -- successfully.
+    | Resp_DoneExiting
+      -- ^ A command sent when an exit command is about to be
+      -- completed.
 
 -- | Should token-based highlighting be removed in conjunction with
 -- the application of new highlighting (in order to reduce the risk of
@@ -73,39 +94,74 @@ data MakeCaseVariant = Function | ExtendedLambda
 -- | Info to display at the end of an interactive command
 
 data DisplayInfo
-    = Info_CompilationOk String String
-      -- ^ Strings are the warnings and the (non-fatal) errors
-    | Info_Constraints String
-    | Info_AllGoalsWarnings String String String
-        -- ^ Strings are the goals, the warnings and the (non-fatal) errors
-    | Info_Time Doc
-    | Info_Error String
+    = Info_CompilationOk CompilerBackend WarningsAndNonFatalErrors
+    | Info_Constraints [OutputForm Expr Expr]
+    | Info_AllGoalsWarnings Goals WarningsAndNonFatalErrors
+    | Info_Time CPUTime
+    | Info_Error Info_Error
         -- ^ When an error message is displayed this constructor should be
         -- used, if appropriate.
---    | Info_Warning String --FNF: currently unused
-    | Info_Intro Doc
-        -- ^ 'Info_Intro' denotes two different types of errors
-        --   TODO: split these into separate constructors
+    | Info_Intro_NotFound
+    | Info_Intro_ConstructorUnknown [String]
     | Info_Auto String
         -- ^ 'Info_Auto' denotes either an error or a success (when 'Resp_GiveAction' is present)
         --   TODO: split these into separate constructors
-    | Info_ModuleContents Doc
-    | Info_SearchAbout Doc
-    | Info_WhyInScope Doc
-    | Info_NormalForm Doc
-    | Info_GoalType Doc
-    | Info_CurrentGoal Doc
-    | Info_InferredType Doc
-    | Info_Context Doc
-    | Info_HelperFunction Doc
+    | Info_ModuleContents [Name] I.Telescope [(Name, I.Type)]
+    | Info_SearchAbout [(Name, I.Type)] String
+    | Info_WhyInScope WhyInScopeData
+    | Info_NormalForm CommandState ComputeMode (Maybe CPUTime) A.Expr
+    | Info_InferredType CommandState (Maybe CPUTime) A.Expr
+    | Info_Context InteractionId [ResponseContextEntry]
     | Info_Version
-        deriving Show
+    | Info_GoalSpecific InteractionId GoalDisplayInfo
+
+data GoalDisplayInfo
+    = Goal_HelperFunction (OutputConstraint' A.Expr A.Expr)
+    | Goal_NormalForm ComputeMode A.Expr
+    | Goal_GoalType Rewrite GoalTypeAux [ResponseContextEntry] [IPBoundary' Expr] [OutputForm Expr Expr]
+    | Goal_CurrentGoal Rewrite
+    | Goal_InferredType A.Expr
+
+-- | Goals & Warnings
+type Goals = ( [OutputConstraint A.Expr InteractionId] -- visible metas (goals)
+             , [OutputConstraint A.Expr NamedMeta]     -- hidden (unsolved) metas
+             )
+
+-- | Errors that goes into Info_Error
+--
+--   When an error message is displayed this constructor should be
+--   used, if appropriate.
+data Info_Error
+    = Info_GenericError TCErr
+    | Info_CompilationError [TCWarning]
+    | Info_HighlightingParseError InteractionId
+    | Info_HighlightingScopeCheckError InteractionId
+
+-- | Auxiliary information that comes with Goal Type
+
+data GoalTypeAux
+    = GoalOnly
+    | GoalAndHave A.Expr
+    | GoalAndElaboration I.Term
+
+-- | Entry in context.
+
+data ResponseContextEntry = ResponseContextEntry
+  { respOrigName :: Name        -- ^ The original concrete name.
+  , respReifName :: Name        -- ^ The name reified from abstract syntax.
+  , respType     :: Arg A.Expr  -- ^ The type.
+  , respLetValue :: Maybe A.Expr -- ^ The value (if it is a let-bound variable)
+  , respInScope  :: NameInScope -- ^ Whether the 'respReifName' is in scope.
+  }
+
 
 -- | Status information.
 
 data Status = Status
   { sShowImplicitArguments :: Bool
     -- ^ Are implicit arguments displayed?
+  , sShowIrrelevantArguments :: Bool
+    -- ^ Are irrelevant arguments displayed?
   , sChecked               :: Bool
     -- ^ Has the module been successfully type checked?
   }
@@ -145,7 +201,7 @@ type InteractionOutputCallback = Response -> TCM ()
 -- things to stdout (other things generate internal errors).
 
 defaultInteractionOutputCallback :: InteractionOutputCallback
-defaultInteractionOutputCallback r = case r of
+defaultInteractionOutputCallback = \case
   Resp_HighlightingInfo {}  -> __IMPOSSIBLE__
   Resp_Status {}            -> __IMPOSSIBLE__
   Resp_JumpToError {}       -> __IMPOSSIBLE__
@@ -160,3 +216,4 @@ defaultInteractionOutputCallback r = case r of
   Resp_ClearRunningInfo {}  -> __IMPOSSIBLE__
   Resp_ClearHighlighting {} -> __IMPOSSIBLE__
   Resp_DoneAborting {}      -> __IMPOSSIBLE__
+  Resp_DoneExiting {}       -> __IMPOSSIBLE__

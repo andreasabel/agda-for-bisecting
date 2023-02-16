@@ -1,33 +1,33 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-module Agda.Compiler.Treeless.Erase (eraseTerms, computeErasedConstructorArgs) where
+module Agda.Compiler.Treeless.Erase
+       ( eraseTerms
+       , computeErasedConstructorArgs
+       , isErasable
+       ) where
 
-import Control.Arrow ((&&&), (***), first, second)
+import Control.Arrow (first, second)
 import Control.Monad
 import Control.Monad.State
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Semigroup
+import qualified Data.List as List
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal as I
-import Agda.Syntax.Abstract.Name (QName)
 import Agda.Syntax.Position
 import Agda.Syntax.Treeless
 import Agda.Syntax.Literal
 
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Monad as I
-import Agda.TypeChecking.Monad.Builtin
 import Agda.TypeChecking.Telescope
-import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Datatypes
-import Agda.TypeChecking.Pretty hiding ((<>))
+import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Primitive
 
+import {-# SOURCE #-} Agda.Compiler.Backend
 import Agda.Compiler.Treeless.Subst
-import Agda.Compiler.Treeless.Pretty
 import Agda.Compiler.Treeless.Unused
 
 import Agda.Utils.Functor
@@ -36,15 +36,18 @@ import Agda.Utils.Maybe
 import Agda.Utils.Memo
 import Agda.Utils.Monad
 import Agda.Utils.Pretty (prettyShow)
-import qualified Agda.Utils.Pretty as P
 import Agda.Utils.IntSet.Infinite (IntSet)
 import qualified Agda.Utils.IntSet.Infinite as IntSet
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
-data ESt = ESt { _funMap  :: Map QName FunInfo
-               , _typeMap :: Map QName TypeInfo }
+-- | State of the eraser.
+data ESt = ESt
+  { _funMap  :: Map QName FunInfo
+      -- ^ Memoize computed `FunInfo` for functions/constructors/... `QName`.
+  , _typeMap :: Map QName TypeInfo
+      -- ^ Memoize computed `TypeInfo` for data/record types `QName`.
+  }
 
 funMap :: Lens' (Map QName FunInfo) ESt
 funMap f r = f (_funMap r) <&> \ a -> r { _funMap = a }
@@ -52,6 +55,7 @@ funMap f r = f (_funMap r) <&> \ a -> r { _funMap = a }
 typeMap :: Lens' (Map QName TypeInfo) ESt
 typeMap f r = f (_typeMap r) <&> \ a -> r { _typeMap = a }
 
+-- | Eraser monad.
 type E = StateT ESt TCM
 
 runE :: E a -> TCM a
@@ -60,11 +64,11 @@ runE m = evalStateT m (ESt Map.empty Map.empty)
 -- | Takes the name of the data/record type.
 computeErasedConstructorArgs :: QName -> TCM ()
 computeErasedConstructorArgs d = do
-  cs <- getConstructors d
+  cs <- getNotErasedConstructors d
   runE $ mapM_ getFunInfo cs
 
-eraseTerms :: QName -> TTerm -> TCM TTerm
-eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
+eraseTerms :: QName -> EvaluationStrategy -> TTerm -> TCM TTerm
+eraseTerms q eval t = usedArguments q t *> runE (eraseTop q t)
   where
     eraseTop q t = do
       (_, h) <- getFunInfo q
@@ -75,7 +79,7 @@ eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
 
     erase t = case tAppView t of
 
-      TCon c : vs -> do
+      (TCon c, vs) -> do
         (rs, h) <- getFunInfo c
         when (length rs < length vs) __IMPOSSIBLE__
         case h of
@@ -83,12 +87,12 @@ eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
           Empty    -> pure TErased
           _        -> tApp (TCon c) <$> zipWithM eraseRel rs vs
 
-      TDef f : vs -> do
+      (TDef f, vs) -> do
         (rs, h) <- getFunInfo f
         case h of
           Erasable -> pure TErased
           Empty    -> pure TErased
-          _        -> tApp (TDef f) <$> zipWithM eraseRel (rs ++ repeat Relevant) vs
+          _        -> tApp (TDef f) <$> zipWithM eraseRel (rs ++ repeat NotErasable) vs
 
       _ -> case t of
         TVar{}         -> pure t
@@ -117,17 +121,18 @@ eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
         TError{}       -> pure t
         TCoerce e      -> TCoerce <$> erase e
 
-    tLam TErased = TErased
-    tLam t       = TLam t
+    -- #3380: this is not safe for strict backends
+    tLam TErased | eval == LazyEvaluation = TErased
+    tLam t                                = TLam t
 
     tLet e b
       | freeIn 0 b = TLet e b
-      | otherwise  = strengthen __IMPOSSIBLE__ b
+      | otherwise  = strengthen impossible b
 
     tApp f []                  = f
     tApp TErased _             = TErased
     tApp f _ | isUnreachable f = tUnreachable
-    tApp f es                  = TApp f es
+    tApp f es                  = mkTApp f es
 
     tCase x t d bs
       | isErased d && all (isErased . aBody) bs = pure TErased
@@ -145,13 +150,13 @@ eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
 
     isErased t = t == TErased || isUnreachable t
 
-    eraseRel r t | erasableR r = pure TErased
-                 | otherwise   = erase t
+    eraseRel r t | erasable r = pure TErased
+                 | otherwise  = erase t
 
-    eraseAlt a = case a of
+    eraseAlt = \case
       TALit l b   -> TALit l   <$> erase b
       TACon c a b -> do
-        rs <- map erasableR . fst <$> getFunInfo c
+        rs <- map erasable . fst <$> getFunInfo c
         let sub = foldr (\ e -> if e then (TErased :#) . wkS 1 else liftS 1) idS $ reverse rs
         TACon c a <$> erase (applySubst sub b)
       TAGuard g b -> TAGuard   <$> erase g <*> erase b
@@ -159,8 +164,19 @@ eraseTerms q t = usedArguments q t *> runE (eraseTop q t)
 -- | Doesn't have any type information (other than the name of the data type),
 --   so we can't do better than checking if all constructors are present.
 pruneUnreachable :: Int -> CaseType -> TTerm -> [TAlt] -> E (TTerm, [TAlt])
-pruneUnreachable _ (CTData q) d bs = do
-  cs <- lift $ getConstructors q
+pruneUnreachable _ (CTData quantity q) d bs' = do
+  -- In an erased setting erased constructors are not treated
+  -- specially.
+  cs <- lift $
+        if hasQuantity0 quantity
+        then getConstructors q
+        else getNotErasedConstructors q
+  let bs | hasQuantity0 quantity = bs'
+         | otherwise             =
+           flip filter bs' $ \case
+             a@TACon{} -> (aCon a) `elem` cs
+             TAGuard{} -> True
+             TALit{}   -> True
   let complete =length cs == length [ b | b@TACon{} <- bs ]
   let d' | complete  = tUnreachable
          | otherwise = d
@@ -170,11 +186,11 @@ pruneUnreachable x CTInt d bs = return $ pruneIntCase x d bs IntSet.empty
 pruneUnreachable _ _ d bs = pure (d, bs)
 
 -- These are the guards we generate for Int/Nat pattern matching
-pattern Below :: Range -> Int -> Integer -> TTerm
-pattern Below r x n = TApp (TPrim PLt)  [TVar x, TLit (LitNat r n)]
+pattern Below :: Int -> Integer -> TTerm
+pattern Below x n = TApp (TPrim PLt)  [TVar x, TLit (LitNat n)]
 
-pattern Above :: Range -> Int -> Integer -> TTerm
-pattern Above r x n = TApp (TPrim PGeq) [TVar x, TLit (LitNat r n)]
+pattern Above :: Int -> Integer -> TTerm
+pattern Above x n = TApp (TPrim PGeq) [TVar x, TLit (LitNat n)]
 
 -- | Strip unreachable clauses (replace by tUnreachable for the default).
 --   Fourth argument is the set of ints covered so far.
@@ -186,9 +202,9 @@ pruneIntCase x d bs cover = go bs cover
       | otherwise            = (d, [])
     go (b : bs) cover =
       case b of
-        TAGuard (Below _ y n) _ | x == y -> rec (IntSet.below n)
-        TAGuard (Above _ y n) _ | x == y -> rec (IntSet.above n)
-        TALit (LitNat _ n) _             -> rec (IntSet.singleton n)
+        TAGuard (Below y n) _ | x == y -> rec (IntSet.below n)
+        TAGuard (Above y n) _ | x == y -> rec (IntSet.above n)
+        TALit (LitNat n) _             -> rec (IntSet.singleton n)
         _                                -> second (b :) $ go bs cover
       where
         rec this = second addAlt $ go bs cover'
@@ -197,7 +213,7 @@ pruneIntCase x d bs cover = go bs cover
             cover' = this' <> cover
             addAlt = case IntSet.toFiniteList this' of
                        Just []  -> id                                     -- unreachable case
-                       Just [n] -> (TALit (LitNat noRange n) (aBody b) :) -- possibly refined case
+                       Just [n] -> (TALit (LitNat n) (aBody b) :) -- possibly refined case
                        _        -> (b :)                                  -- unchanged case
 
 data TypeInfo = Empty | Erasable | NotErasable
@@ -212,52 +228,56 @@ sumTypeInfo is = foldr plus Empty is
     plus r           Erasable    = r
     plus NotErasable NotErasable = NotErasable
 
-erasableR :: Relevance -> Bool
-erasableR Relevant   = False
-erasableR NonStrict  = True
-erasableR Irrelevant = True
-
 erasable :: TypeInfo -> Bool
 erasable Erasable    = True
 erasable Empty       = True
 erasable NotErasable = False
 
-type FunInfo = ([Relevance], TypeInfo)
+type FunInfo = ([TypeInfo], TypeInfo)
 
 getFunInfo :: QName -> E FunInfo
 getFunInfo q = memo (funMap . key q) $ getInfo q
   where
+    getInfo :: QName -> E FunInfo
     getInfo q = do
       (rs, t) <- do
         (tel, t) <- lift $ typeWithoutParams q
         is     <- mapM (getTypeInfo . snd . dget) tel
-        used   <- lift $ (++ repeat True) <$> getCompiledArgUse q
+        used   <- lift $ (++ repeat ArgUsed) . fromMaybe [] <$> getCompiledArgUse q
         forced <- lift $ (++ repeat NotForced) <$> getForcedArgs q
-        return (zipWith3 (uncurry . mkR . getRelevance) tel (zip forced used) is, t)
+        return (zipWith3 (uncurry . mkR . getModality) tel (zip forced used) is, t)
       h <- if isAbsurdLambdaName q then pure Erasable else getTypeInfo t
       lift $ reportSLn "treeless.opt.erase.info" 50 $ "type info for " ++ prettyShow q ++ ": " ++ show rs ++ " -> " ++ show h
-      lift $ setErasedConArgs q $ map erasableR rs
+      lift $ setErasedConArgs q $ map erasable rs
       return (rs, h)
 
-    -- Treat empty, erasable, or unused arguments as NonStrict (and thus erasable)
-    mkR :: Relevance -> IsForced -> Bool -> TypeInfo -> Relevance
-    mkR Irrelevant _ _ _  = Irrelevant
-    mkR _ _ False _       = NonStrict
-    mkR _ Forced _ _      = NonStrict
-    mkR r _ _ NotErasable = r
-    mkR _ _ _ Empty       = NonStrict
-    mkR _ _ _ Erasable    = NonStrict
+    -- Treat empty, erasable, or unused arguments as Erasable
+    mkR :: Modality -> IsForced -> ArgUsage -> TypeInfo -> TypeInfo
+    mkR m f u i
+      | not (usableModality m) = Erasable
+      | ArgUnused <- u         = Erasable
+      | Forced <- f            = Erasable
+      | otherwise              = i
+
+isErasable :: QName -> TCM Bool
+isErasable qn =
+  -- The active backend should be set
+  caseMaybeM (viewTC eActiveBackendName) __IMPOSSIBLE__ $ \ bname ->
+  -- However it may not be part of the set of available backends
+  -- in which case we default to not erasable to avoid false negatives.
+  caseMaybeM (lookupBackend bname)       (pure False)   $ \ _ ->
+  erasable . snd <$> runE (getFunInfo qn)
 
 telListView :: Type -> TCM (ListTel, Type)
 telListView t = do
-  TelV tel t <- telView t
+  TelV tel t <- telViewPath t
   return (telToList tel, t)
 
 typeWithoutParams :: QName -> TCM (ListTel, Type)
 typeWithoutParams q = do
   def <- getConstInfo q
   let d = case I.theDef def of
-        Function{ funProjection = Just Projection{ projIndex = i } } -> i - 1
+        Function{ funProjection = Right Projection{ projIndex = i } } -> i - 1
         Constructor{ conPars = n } -> n
         _                          -> 0
   first (drop d) <$> telListView (defType def)
@@ -276,29 +296,32 @@ getTypeInfo t0 = do
     Sort{}    -> return Erasable
     _         -> return NotErasable
   is <- mapM (getTypeInfo . snd . dget) tel
-  let e | any (== Empty) is = Erasable
-        | null is           = et        -- TODO: guard should really be "all inhabited is"
-        | et == Empty       = Erasable
-        | otherwise         = et
+  let e | Empty `elem` is = Erasable
+        | null is         = et        -- TODO: guard should really be "all inhabited is"
+        | et == Empty     = Erasable
+        | otherwise       = et
   lift $ reportSDoc "treeless.opt.erase.type" 50 $ prettyTCM t0 <+> text ("is " ++ show e)
   return e
   where
-    typeInfo :: QName -> E TypeInfo
-    typeInfo q = memoRec (typeMap . key q) Erasable $ do  -- assume recursive occurrences are erasable
+  typeInfo :: QName -> E TypeInfo
+  typeInfo q = ifM (erasureForbidden q) (return NotErasable) $ {-else-} do
+    memoRec (typeMap . key q) Erasable $ do  -- assume recursive occurrences are erasable
+      mId    <- lift $ getName' builtinId
       msizes <- lift $ mapM getBuiltinName
                          [builtinSize, builtinSizeLt]
       def    <- lift $ getConstInfo q
-      mcs    <- return $ case I.theDef def of
-        I.Datatype{ dataCons = cs } -> Just cs
-        I.Record{ recConHead = c }  -> Just [conName c]
-        _                           -> Nothing
+      let mcs = case I.theDef def of
+                  I.Datatype{ dataCons = cs } -> Just cs
+                  I.Record{ recConHead = c }  -> Just [conName c]
+                  _                           -> Nothing
       case mcs of
+        _ | Just q == mId        -> return NotErasable
         _ | Just q `elem` msizes -> return Erasable
         Just [c] -> do
           (ts, _) <- lift $ typeWithoutParams c
-          let rs = map getRelevance ts
+          let rs = map getModality ts
           is <- mapM (getTypeInfo . snd . dget) ts
-          let er = and [ erasable i || erasableR r | (i, r) <- zip is rs ]
+          let er = and [ erasable i || not (usableModality r) | (i, r) <- zip is rs ]
           return $ if er then Erasable else NotErasable
         Just []      -> return Empty
         Just (_:_:_) -> return NotErasable
@@ -307,3 +330,6 @@ getTypeInfo t0 = do
             I.Function{ funClauses = cs } ->
               sumTypeInfo <$> mapM (maybe (return Empty) (getTypeInfo . El __DUMMY_SORT__) . clauseBody) cs
             _ -> return NotErasable
+  -- The backend also has a say whether a type is eraseable or not.
+  erasureForbidden :: QName -> E Bool
+  erasureForbidden q = lift $ not <$> activeBackendMayEraseType q

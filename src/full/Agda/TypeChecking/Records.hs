@@ -1,122 +1,187 @@
-{-# LANGUAGE CPP                      #-}
 {-# LANGUAGE NondecreasingIndentation #-}
 
 module Agda.TypeChecking.Records where
 
-#if MIN_VERSION_base(4,11,0)
-import Prelude hiding ((<>))
-#endif
+import Prelude hiding (null)
 
 import Control.Monad
-import Control.Monad.Reader
+import Control.Monad.Except
 import Control.Monad.Trans.Maybe
+import Control.Monad.Writer
+import Control.Applicative
 
-import Data.Function
+import Data.Bifunctor
 import qualified Data.List as List
 import Data.Maybe
+import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Traversable (traverse)
+import qualified Data.HashMap.Strict as HMap
 
 import Agda.Syntax.Common
 import qualified Agda.Syntax.Concrete.Name as C
-import Agda.Syntax.Concrete (FieldAssignment'(..), nameFieldA)
+import Agda.Syntax.Concrete (FieldAssignment'(..))
 import Agda.Syntax.Abstract.Name
+import Agda.Syntax.Internal.MetaVars (unblockOnAnyMetaIn)
 import Agda.Syntax.Internal as I
 import Agda.Syntax.Position
+import Agda.Syntax.Scope.Base (isNameInScope)
 
+import Agda.TypeChecking.Irrelevance
 import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Pretty
+import Agda.TypeChecking.Pretty as TCM
 import Agda.TypeChecking.Reduce
-import Agda.TypeChecking.Reduce.Monad ()
+import Agda.TypeChecking.Reduce.Monad () --instance only
+import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
+import Agda.TypeChecking.Warnings
+import {-# SOURCE #-} Agda.TypeChecking.Primitive.Cubical.Base (isCubicalSubtype)
 
 import {-# SOURCE #-} Agda.TypeChecking.ProjectionLike (eligibleForProjectionLike)
 
 import Agda.Utils.Either
-import Agda.Utils.Functor (for, ($>))
+import Agda.Utils.Function (applyWhen)
+import Agda.Utils.Functor (for, ($>), (<&>))
 import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
-import qualified Agda.Utils.HashMap as HMap
 import Agda.Utils.Pretty (prettyShow)
+import Agda.Utils.Singleton
 import Agda.Utils.Size
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 mkCon :: ConHead -> ConInfo -> Args -> Term
 mkCon h info args = Con h info (map Apply args)
 
 -- | Order the fields of a record construction.
---   Use the second argument for missing fields.
-orderFields :: QName -> a -> [C.Name] -> [(C.Name, a)] -> TCM [a]
-orderFields r def xs fs = do
-  unlessNull (ys List.\\ List.nub ys) $ typeError . DuplicateFields . List.nub
-  unlessNull (ys List.\\ xs)          $ typeError . TooManyFields r
-  -- shouldBeNull (xs List.\\ ys)     $ TooFewFields r
-  return $ order xs fs
+orderFields
+  :: forall a . HasRange a
+  => QName             -- ^ Name of record type (for error message).
+  -> (Arg C.Name -> a) -- ^ How to fill a missing field.
+  -> [Arg C.Name]      -- ^ Field names of the record type.
+  -> [(C.Name, a)]     -- ^ Provided fields with content in the record expression.
+  -> Writer [RecordFieldWarning] [a]           -- ^ Content arranged in official order.
+orderFields r fill axs fs = do
+  -- reportSDoc "tc.record" 30 $ vcat
+  --   [ "orderFields"
+  --   , "  official fields: " <+> sep (map pretty xs)
+  --   , "  provided fields: " <+> sep (map pretty ys)
+  --   ]
+  unlessNull alien     $ warn $ TooManyFieldsWarning r missing
+  unlessNull duplicate $ warn $ DuplicateFieldsWarning
+  return $ for axs $ \ ax -> fromMaybe (fill ax) $ lookup (unArg ax) uniq
   where
-    ys = map fst fs
+    (uniq, duplicate) = nubAndDuplicatesOn fst fs   -- separating duplicate fields
+    xs        = map unArg axs                       -- official fields (accord. record type)
+    missing   = filter (not . hasElem (map fst fs)) xs  -- missing  fields
+    alien     = filter (not . hasElem xs . fst) fs      -- spurious fields
+    warn w    = tell . singleton . w . map (second getRange)
 
-    -- invariant: the first list contains at least the fields of the second list
-    order [] [] = []
-    order [] _  = __IMPOSSIBLE__
-    order (x : xs) ys = case lookup x (assocHoles ys) of
-      Just (e, ys') -> e : order xs ys'
-      Nothing       -> def : order xs ys
+-- | Raise generated 'RecordFieldWarning's as warnings.
+warnOnRecordFieldWarnings :: Writer [RecordFieldWarning] a -> TCM a
+warnOnRecordFieldWarnings comp = do
+  let (res, ws) = runWriter comp
+  mapM_ (warning . RecordFieldWarning) ws
+  return res
 
-    assocHoles xs = [ (x, (v, xs')) | ((x, v), xs') <- holes xs ]
+-- | Raise generated 'RecordFieldWarning's as errors.
+failOnRecordFieldWarnings :: Writer [RecordFieldWarning] a -> TCM a
+failOnRecordFieldWarnings comp = do
+  let (res, ws) = runWriter comp
+  mapM_ (typeError . recordFieldWarningToError) ws
+    -- This will raise the first warning (if any) as error.
+  return res
+
+-- | Order the fields of a record construction.
+--   Raise generated 'RecordFieldWarning's as warnings.
+orderFieldsWarn
+  :: forall a . HasRange a
+  => QName             -- ^ Name of record type (for error message).
+  -> (Arg C.Name -> a) -- ^ How to fill a missing field.
+  -> [Arg C.Name]      -- ^ Field names of the record type.
+  -> [(C.Name, a)]     -- ^ Provided fields with content in the record expression.
+  -> TCM [a]           -- ^ Content arranged in official order.
+orderFieldsWarn r fill axs fs = warnOnRecordFieldWarnings $ orderFields r fill axs fs
+
+-- | Order the fields of a record construction.
+--   Raise generated 'RecordFieldWarning's as errors.
+orderFieldsFail
+  :: forall a . HasRange a
+  => QName             -- ^ Name of record type (for error message).
+  -> (Arg C.Name -> a) -- ^ How to fill a missing field.
+  -> [Arg C.Name]      -- ^ Field names of the record type.
+  -> [(C.Name, a)]     -- ^ Provided fields with content in the record expression.
+  -> TCM [a]           -- ^ Content arranged in official order.
+orderFieldsFail r fill axs fs = failOnRecordFieldWarnings $ orderFields r fill axs fs
 
 -- | A record field assignment @record{xs = es}@ might not mention all
 --   visible fields.  @insertMissingFields@ inserts placeholders for
 --   the missing visible fields and returns the values in order
 --   of the fields in the record declaration.
 insertMissingFields
-  :: QName                -- ^ Name of record type (for error reporting).
+  :: forall a . HasRange a
+  => QName                -- ^ Name of record type (for error reporting).
   -> (C.Name -> a)        -- ^ Function to generate a placeholder for missing visible field.
   -> [FieldAssignment' a] -- ^ Given fields.
   -> [Arg C.Name]         -- ^ All record field names with 'ArgInfo'.
-  -> TCM [NamedArg a]     -- ^ Given fields enriched by placeholders for missing explicit fields.
+  -> Writer [RecordFieldWarning] [NamedArg a]
+       -- ^ Given fields enriched by placeholders for missing explicit fields.
 insertMissingFields r placeholder fs axs = do
   -- Compute the list of given fields, decorated with the ArgInfo from the record def.
-  let arg x e =
-        case [ a | a <- axs, unArg a == x ] of
-          [a] -> nameIfHidden a e <$ a
-          _   -> defaultNamedArg e -- we only end up here if the field names are bad
+  let arg x e = caseMaybe (List.find ((x ==) . unArg) axs) (defaultNamedArg e) $ \ a ->
+        nameIfHidden a e <$ a
       givenFields = [ (x, Just $ arg x e) | FieldAssignment x e <- fs ]
-  -- Compute a list of p[aceholders for the missing visible fields.
-  let missingExplicits =
-       [ (x, Just $ setOrigin Inserted $ nameIfHidden a . placeholder <$> a)
-       | a <- filter visible axs
-       , let x = unArg a
-       , x `notElem` map (view nameFieldA) fs
-       ]
-  -- In es omitted explicit fields are replaced by placeholders
-  -- (from missingExplicits). Omitted implicit or instance fields
+
+  -- Omitted explicit fields are filled in with placeholders.
+  -- Omitted implicit or instance fields
   -- are still left out and inserted later by checkArguments_.
-  catMaybes <$> do
-    -- Default value @Nothing@ will only be used for missing hidden fields.
-    -- These can be ignored as they will be inserted by @checkArguments_@.
-    orderFields r Nothing (map unArg axs) $ givenFields ++ missingExplicits
+  catMaybes <$> orderFields r fill axs givenFields
   where
+    fill :: Arg C.Name -> Maybe (NamedArg a)
+    fill ax
+      | visible ax = Just $ setOrigin Inserted $ unnamed . placeholder <$> ax
+      | otherwise  = Nothing
     -- Andreas, 2017-04-13, issue #2494
     -- We need to put the field names as argument names for hidden arguments.
     -- Otherwise, insertImplicit does not do the right thing.
     nameIfHidden :: Arg C.Name -> c -> Named_ c
     nameIfHidden ax
       | visible ax = unnamed
-      | otherwise  = named (Ranged (getRange ax) $ prettyShow $ unArg ax)
+      | otherwise  = named $ WithOrigin Inserted $ Ranged (getRange ax) $ prettyShow $ unArg ax
 
--- | The name of the module corresponding to a record.
-recordModule :: QName -> ModuleName
-recordModule = mnameFromList . qnameToList
+-- | A record field assignment @record{xs = es}@ might not mention all
+--   visible fields.  @insertMissingFields@ inserts placeholders for
+--   the missing visible fields and returns the values in order
+--   of the fields in the record declaration.
+insertMissingFieldsWarn
+  :: forall a . HasRange a
+  => QName                -- ^ Name of record type (for error reporting).
+  -> (C.Name -> a)        -- ^ Function to generate a placeholder for missing visible field.
+  -> [FieldAssignment' a] -- ^ Given fields.
+  -> [Arg C.Name]         -- ^ All record field names with 'ArgInfo'.
+  -> TCM [NamedArg a]     -- ^ Given fields enriched by placeholders for missing explicit fields.
+insertMissingFieldsWarn r placeholder fs axs =
+  warnOnRecordFieldWarnings $ insertMissingFields r placeholder fs axs
+
+-- | A record field assignment @record{xs = es}@ might not mention all
+--   visible fields.  @insertMissingFields@ inserts placeholders for
+--   the missing visible fields and returns the values in order
+--   of the fields in the record declaration.
+insertMissingFieldsFail
+  :: forall a . HasRange a
+  => QName                -- ^ Name of record type (for error reporting).
+  -> (C.Name -> a)        -- ^ Function to generate a placeholder for missing visible field.
+  -> [FieldAssignment' a] -- ^ Given fields.
+  -> [Arg C.Name]         -- ^ All record field names with 'ArgInfo'.
+  -> TCM [NamedArg a]     -- ^ Given fields enriched by placeholders for missing explicit fields.
+insertMissingFieldsFail r placeholder fs axs =
+  failOnRecordFieldWarnings $ insertMissingFields r placeholder fs axs
 
 -- | Get the definition for a record. Throws an exception if the name
 --   does not refer to a record or the record is abstract.
-getRecordDef :: QName -> TCM Defn
+getRecordDef :: (HasConstInfo m, ReadTCState m, MonadError TCErr m) => QName -> m Defn
 getRecordDef r = maybe err return =<< isRecord r
   where err = typeError $ ShouldBeRecordType (El __DUMMY_SORT__ $ Def r [])
 
@@ -127,10 +192,15 @@ getRecordOfField d = caseMaybeM (isProjection d) (return Nothing) $
     return $ unArg r <$ proper -- if proper then Just (unArg r) else Nothing
 
 -- | Get the field names of a record.
-getRecordFieldNames :: QName -> TCM [Arg C.Name]
+getRecordFieldNames :: (HasConstInfo m, ReadTCState m, MonadError TCErr m)
+                    => QName -> m [Dom C.Name]
 getRecordFieldNames r = recordFieldNames <$> getRecordDef r
 
-recordFieldNames :: Defn -> [Arg C.Name]
+getRecordFieldNames_ :: (HasConstInfo m, ReadTCState m)
+                     => QName -> m (Maybe [Dom C.Name])
+getRecordFieldNames_ r = fmap recordFieldNames <$> isRecord r
+
+recordFieldNames :: Defn -> [Dom C.Name]
 recordFieldNames = map (fmap (nameConcrete . qnameName)) . recFields
 
 -- | Find all records with at least the given fields.
@@ -138,7 +208,8 @@ findPossibleRecords :: [C.Name] -> TCM [QName]
 findPossibleRecords fields = do
   defs  <- HMap.elems <$> useTC (stSignature . sigDefinitions)
   idefs <- HMap.elems <$> useTC (stImports   . sigDefinitions)
-  return $ cands defs ++ cands idefs
+  scope <- getScope
+  return $ filter (`isNameInScope` scope) $ cands defs ++ cands idefs
   where
     cands defs = [ defName d | d <- defs, possible d ]
     possible def =
@@ -146,7 +217,7 @@ findPossibleRecords fields = do
       -- in the fields of record @def@ (if it is a record).
       case theDef def of
         Record{ recFields = fs } -> Set.isSubsetOf given $
-          Set.fromList $ map (nameConcrete . qnameName . unArg) fs
+          Set.fromList $ map (nameConcrete . qnameName . unDom) fs
         _ -> False
     given = Set.fromList fields
 
@@ -157,7 +228,7 @@ getRecordFieldTypes r = recTel <$> getRecordDef r
 -- | Get the field names belonging to a record type.
 getRecordTypeFields
   :: Type  -- ^ Record type.  Need not be reduced.
-  -> TCM [Arg QName]
+  -> TCM [Dom QName]
 getRecordTypeFields t = do
   t <- reduce t  -- Andreas, 2018-03-03, fix for #2989.
   case unEl t of
@@ -170,8 +241,8 @@ getRecordTypeFields t = do
 
 -- | Returns the given record type's constructor name (with an empty
 -- range).
-getRecordConstructor :: QName -> TCM ConHead
-getRecordConstructor r = killRange <$> recConHead <$> getRecordDef r
+getRecordConstructor :: (HasConstInfo m, ReadTCState m, MonadError TCErr m) => QName -> m ConHead
+getRecordConstructor r = killRange . recConHead <$> getRecordDef r
 
 -- | Check if a name refers to a record.
 --   If yes, return record definition.
@@ -187,15 +258,15 @@ isRecord r = do
 -- | Reduce a type and check whether it is a record type.
 --   Succeeds only if type is not blocked by a meta var.
 --   If yes, return its name, parameters, and definition.
-isRecordType :: Type -> TCM (Maybe (QName, Args, Defn))
+isRecordType :: PureTCM m => Type -> m (Maybe (QName, Args, Defn))
 isRecordType t = either (const Nothing) Just <$> tryRecordType t
 
 -- | Reduce a type and check whether it is a record type.
 --   Succeeds only if type is not blocked by a meta var.
 --   If yes, return its name, parameters, and definition.
 --   If no, return the reduced type (unless it is blocked).
-tryRecordType :: Type -> TCM (Either (Blocked Type) (QName, Args, Defn))
-tryRecordType t = ifBlockedType t (\ m a -> return $ Left $ Blocked m a) $ \ nb t -> do
+tryRecordType :: PureTCM m => Type -> m (Either (Blocked Type) (QName, Args, Defn))
+tryRecordType t = ifBlocked t (\ m a -> return $ Left $ Blocked m a) $ \ nb t -> do
   let no = return $ Left $ NotBlocked nb t
   case unEl t of
     Def r es -> do
@@ -225,8 +296,7 @@ origProjection f = do
 --   Precondition: @t@ is reduced.
 --
 --   See also: 'Agda.TypeChecking.Datatypes.getConType'
-getDefType :: (HasConstInfo m, MonadReduce m, MonadDebug m)
-           => QName -> Type -> m (Maybe Type)
+getDefType :: PureTCM m => QName -> Type -> m (Maybe Type)
 getDefType f t = do
   -- Andreas, Issue #1973: we need to take the original projection
   -- since the parameters from the reduced type t are correct for
@@ -239,9 +309,9 @@ getDefType f t = do
   -- if @f@ is not a projection (like) function, @a@ is the correct type
       fallback = return $ Just a
   reportSDoc "tc.deftype" 20 $ vcat
-    [ text "definition f = " <> prettyTCM f <+> text ("  -- raw: " ++ prettyShow f)
-    , text "has type   a = " <> prettyTCM a
-    , text "principal  t = " <> prettyTCM t
+    [ "definition f =" <+> prettyTCM f <+> text ("  -- raw: " ++ prettyShow f)
+    , "has type   a =" <+> prettyTCM a
+    , "principal  t =" <+> prettyTCM t
     ]
   caseMaybe mp fallback $
     \ (Projection{ projIndex = n }) -> if n <= 0 then fallback else do
@@ -262,7 +332,7 @@ getDefType f t = do
             let pars = fromMaybe __IMPOSSIBLE__ $ allApplyElims $ take npars es
             reportSDoc "tc.deftype" 20 $ vcat
               [ text $ "head d     = " ++ prettyShow d
-              , text "parameters =" <+> sep (map prettyTCM pars)
+              , "parameters =" <+> sep (map prettyTCM pars)
               ]
             reportSLn "tc.deftype" 60 $ "parameters = " ++ show pars
             if length pars < npars then failure "does not supply enough parameters"
@@ -273,8 +343,8 @@ getDefType f t = do
     failNotDef  = failure "is not a Def."
     failure reason = do
       reportSDoc "tc.deftype" 25 $ sep
-        [ text "Def. " <+> prettyTCM f <+> text " is projection(like)"
-        , text "but the type "
+        [ "Def. " <+> prettyTCM f <+> " is projection(like)"
+        , "but the type "
         , prettyTCM t
         , text $ "of its argument " ++ reason
         ]
@@ -290,11 +360,12 @@ getDefType f t = do
 --   Precondition: @t@ is reduced.
 --
 projectTyped
-  :: Term        -- ^ Head (record value).
+  :: PureTCM m
+  => Term        -- ^ Head (record value).
   -> Type        -- ^ Its type.
   -> ProjOrigin
   -> QName       -- ^ Projection.
-  -> TCM (Maybe (Dom Type, Term, Type))
+  -> m (Maybe (Dom Type, Term, Type))
 projectTyped v t o f = caseMaybeM (getDefType f t) (return Nothing) $ \ tf -> do
   ifNotPiType tf (const $ return Nothing) {- else -} $ \ dom b -> do
   u <- applyDef o f (argFromDom dom $> v)
@@ -312,7 +383,7 @@ data ElimType
 instance PrettyTCM ElimType where
   prettyTCM (ArgT a)    = prettyTCM a
   prettyTCM (ProjT a b) =
-    text "." <> parens (prettyTCM a <+> text "->" <+> prettyTCM b)
+    "." TCM.<> parens (prettyTCM a <+> "->" <+> prettyTCM b)
 
 -- | Given a head and its type, compute the types of the eliminations.
 
@@ -332,10 +403,23 @@ typeElims a self (e : es) = do
     IApply{} -> __IMPOSSIBLE__
 
 -- | Check if a name refers to an eta expandable record.
+--
+-- The answer is no for a record type with an erased constructor
+-- unless the current quantity is \"erased\".
 {-# SPECIALIZE isEtaRecord :: QName -> TCM Bool #-}
 {-# SPECIALIZE isEtaRecord :: QName -> ReduceM Bool #-}
 isEtaRecord :: HasConstInfo m => QName -> m Bool
-isEtaRecord r = maybe False ((YesEta ==) . recEtaEquality) <$> isRecord r
+isEtaRecord r = do
+  isRec <- isRecord r
+  case isRec of
+    Nothing -> return False
+    Just r
+      | recEtaEquality r /= YesEta -> return False
+      | otherwise                  -> do
+        constructorQ <- getQuantity <$>
+                          getConstInfo (conName (recConHead r))
+        currentQ     <- viewTC eQuantity
+        return $ constructorQ `moreQuantity` currentQ
 
 isEtaCon :: HasConstInfo m => QName -> m Bool
 isEtaCon c = getConstInfo' c >>= \case
@@ -345,9 +429,16 @@ isEtaCon c = getConstInfo' c >>= \case
     Constructor {conData = r} -> isEtaRecord r
     _ -> return False
 
+-- | Going under one of these does not count as a decrease in size for the termination checker.
+isEtaOrCoinductiveRecordConstructor :: HasConstInfo m => QName -> m Bool
+isEtaOrCoinductiveRecordConstructor c =
+  caseMaybeM (isRecordConstructor c) (return False) $ \ (_, def) -> return $
+    recEtaEquality def == YesEta || recInduction def /= Just Inductive
+      -- If in doubt about coinductivity, then yes.
+
 -- | Check if a name refers to a record which is not coinductive.  (Projections are then size-preserving)
 isInductiveRecord :: QName -> TCM Bool
-isInductiveRecord r = maybe False (\ d -> recInduction d /= Just CoInductive) <$> isRecord r
+isInductiveRecord r = maybe False ((Just CoInductive /=) . recInduction) <$> isRecord r
 
 -- | Check if a type is an eta expandable record and return the record identifier and the parameters.
 isEtaRecordType :: (HasConstInfo m)
@@ -371,7 +462,8 @@ isRecordConstructor c = getConstInfo' c >>= \case
 -- | Check if a constructor name is the internally generated record constructor.
 --
 --   Works also for abstract constructors.
-isGeneratedRecordConstructor :: QName -> TCM Bool
+isGeneratedRecordConstructor :: (MonadTCEnv m, HasConstInfo m)
+                             => QName -> m Bool
 isGeneratedRecordConstructor c = ignoreAbstractMode $ do
   caseMaybeM (isRecordConstructor c) (return False) $ \ (_, def) ->
     case def of
@@ -381,35 +473,36 @@ isGeneratedRecordConstructor c = ignoreAbstractMode $ do
 
 -- | Turn off eta for unguarded recursive records.
 --   Projections do not preserve guardedness.
-unguardedRecord :: QName -> TCM ()
-unguardedRecord q = modifySignature $ updateDefinition q $ updateTheDef $ \case
-  r@Record{} -> r { recEtaEquality' = setEtaEquality (recEtaEquality' r) NoEta }
+unguardedRecord :: QName -> PatternOrCopattern -> TCM ()
+unguardedRecord q pat = modifySignature $ updateDefinition q $ updateTheDef $ \case
+  r@Record{} -> r { recEtaEquality' = setEtaEquality (recEtaEquality' r) $ NoEta pat }
   _ -> __IMPOSSIBLE__
+
+-- | Turn on eta for non-recursive and inductive guarded recursive records,
+--   unless user declared otherwise.
+--   Projections do not preserve guardedness.
+updateEtaForRecord :: QName -> TCM ()
+updateEtaForRecord q = whenM etaEnabled $ do
+
+  -- Do we need to switch on eta for record q?
+  switchEta <- getConstInfo q <&> theDef <&> \case
+    Record{ recInduction = ind, recEtaEquality' = eta }
+      | Inferred NoEta{} <- eta, ind /= Just CoInductive -> True
+      | otherwise -> False
+    _ -> __IMPOSSIBLE__
+
+  when switchEta $ do
+    modifySignature $ updateDefinition q $ over (lensTheDef . lensRecord) $ \ d ->
+      d{ _recEtaEquality' = Inferred YesEta }
 
 -- | Turn on eta for inductive guarded recursive records.
 --   Projections do not preserve guardedness.
 recursiveRecord :: QName -> TCM ()
-recursiveRecord q = do
-  ok <- etaEnabled
-  modifySignature $ updateDefinition q $ updateTheDef $ \case
-    r@Record{ recInduction = ind, recEtaEquality' = eta } ->
-      r { recEtaEquality' = eta' }
-      where
-      eta' | ok, eta == Inferred NoEta, ind /= Just CoInductive = Inferred YesEta
-           | otherwise = eta
-    _ -> __IMPOSSIBLE__
+recursiveRecord = updateEtaForRecord
 
 -- | Turn on eta for non-recursive record, unless user declared otherwise.
 nonRecursiveRecord :: QName -> TCM ()
-nonRecursiveRecord q = whenM etaEnabled $ do
-  -- Do nothing if eta is disabled by option.
-  modifySignature $ updateDefinition q $ updateTheDef $ \case
-    r@Record{ recInduction = ind, recEtaEquality' = Inferred NoEta }
-      | ind /= Just CoInductive ->
-      r { recEtaEquality' = Inferred YesEta }
-    r@Record{} -> r
-    _          -> __IMPOSSIBLE__
-
+nonRecursiveRecord = updateEtaForRecord
 
 -- | Check whether record type is marked as recursive.
 --
@@ -437,7 +530,7 @@ etaExpandBoundVar i = fmap (\ (delta, sigma, tau, _) -> (delta, sigma, tau)) <$>
 --
 --   Postcondition: @Δ = Γ₁, Γ', Γ₂[c Γ']@ and @Γ ⊢ σ : Δ@ and @Δ ⊢ τ : Γ@.
 
-expandRecordVar :: Int -> Telescope -> TCM (Maybe (Telescope, Substitution, Substitution, Telescope))
+expandRecordVar :: PureTCM m => Int -> Telescope -> m (Maybe (Telescope, Substitution, Substitution, Telescope))
 expandRecordVar i gamma0 = do
   -- Get the context with last variable added last in list.
   let gamma = telToList gamma0
@@ -445,21 +538,22 @@ expandRecordVar i gamma0 = do
       l     = size gamma - 1 - i
   -- Extract type of @i@th de Bruijn index.
   -- Γ = Γ₁, x:a, Γ₂
-  let (gamma1, dom@(Dom{domInfo = ai, unDom = (x, a)}) : gamma2) = splitAt l gamma
+  let (gamma1, dom@(Dom{domInfo = ai, unDom = (x, a)}) : gamma2) = splitAt l gamma -- TODO:: Defined but not used dom, ai
   -- This must be a eta-expandable record type.
   let failure = do
         reportSDoc "tc.meta.assign.proj" 25 $
-          text "failed to eta-expand variable " <+> pretty x <+>
-          text " since its type " <+> prettyTCM a <+>
-          text " is not a record type"
+          "failed to eta-expand variable " <+> pretty x <+>
+          " since its type " <+> prettyTCM a <+>
+          " is not a record type"
         return Nothing
-  caseMaybeM (isRecordType a) failure $ \ (r, pars, def) -> do
-    if recEtaEquality def == NoEta then return Nothing else Just <$> do
+  caseMaybeM (isRecordType a) failure $ \ (r, pars, def) -> case recEtaEquality def of
+    NoEta{} -> return Nothing
+    YesEta  -> Just <$> do
       -- Get the record fields @Γ₁ ⊢ tel@ (@tel = Γ'@).
       -- TODO: compose argInfo ai with tel.
       let tel = recTel def `apply` pars
           m   = size tel
-          fs  = recFields def
+          fs  = map argFromDom $ recFields def
       -- Construct the record pattern @Γ₁, Γ' ⊢ u := c ys@.
           ys  = zipWith (\ f i -> f $> var i) fs $ downFrom m
           u   = mkCon (recConHead def) ConOSystem ys
@@ -522,11 +616,12 @@ curryAt t n = do
       -- This might trigger another call to @etaExpandProjectedVar@ later.
       -- A more efficient version does all the eta-expansions at once here.
       (r, pars, def) <- fromMaybe __IMPOSSIBLE__ <$> isRecordType a
-      when (recEtaEquality def == NoEta) __IMPOSSIBLE__
+      if | NoEta _ <- recEtaEquality def -> __IMPOSSIBLE__
+         | otherwise -> return ()
       -- TODO: compose argInfo ai with tel.
       let tel = recTel def `apply` pars
           m   = size tel
-          fs  = recFields def
+          fs  = map argFromDom $ recFields def
           ys  = zipWith (\ f i -> f $> var i) fs $ downFrom m
           u   = mkCon (recConHead def) ConOSystem ys
           b'  = raise m b `absApp` u
@@ -556,24 +651,27 @@ curryAt t n = do
 
     where @tel@ is the record telescope instantiated at the parameters @pars@.
 -}
-etaExpandRecord :: QName -> Args -> Term -> TCM (Telescope, Args)
+etaExpandRecord :: (HasConstInfo m, MonadDebug m, ReadTCState m)
+                => QName -> Args -> Term -> m (Telescope, Args)
 etaExpandRecord = etaExpandRecord' False
 
 -- | Eta expand a record regardless of whether it's an eta-record or not.
-forceEtaExpandRecord :: QName -> Args -> Term -> TCM (Telescope, Args)
+forceEtaExpandRecord :: (HasConstInfo m, MonadDebug m, ReadTCState m, MonadError TCErr m)
+                     => QName -> Args -> Term -> m (Telescope, Args)
 forceEtaExpandRecord = etaExpandRecord' True
 
-etaExpandRecord' :: Bool -> QName -> Args -> Term -> TCM (Telescope, Args)
+etaExpandRecord' :: (HasConstInfo m, MonadDebug m, ReadTCState m)
+                 => Bool -> QName -> Args -> Term -> m (Telescope, Args)
 etaExpandRecord' forceEta r pars u = do
-  def <- getRecordDef r
+  def <- fromMaybe __IMPOSSIBLE__ <$> isRecord r
   (tel, _, _, args) <- etaExpandRecord'_ forceEta r pars def u
   return (tel, args)
 
-etaExpandRecord_ :: (MonadTCEnv m, HasOptions m, MonadDebug m)
+etaExpandRecord_ :: HasConstInfo m
                  => QName -> Args -> Defn -> Term -> m (Telescope, ConHead, ConInfo, Args)
 etaExpandRecord_ = etaExpandRecord'_ False
 
-etaExpandRecord'_ :: (MonadTCEnv m, HasOptions m, MonadDebug m)
+etaExpandRecord'_ :: HasConstInfo m
                   => Bool -> QName -> Args -> Defn -> Term -> m (Telescope, ConHead, ConInfo, Args)
 etaExpandRecord'_ forceEta r pars def u = do
   let Record{ recConHead     = con
@@ -588,9 +686,11 @@ etaExpandRecord'_ forceEta r pars def u = do
     -- Already expanded.
     Con con_ ci es -> do
       let args = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-      when (con /= con_) $ do
+      -- Andreas, 2019-10-21, issue #4148
+      -- @con == con_@ might fail, but their normal forms should be equal.
+      whenNothingM (conName con `sameDef` conName con_) $ do
         reportSDoc "impossible" 10 $ vcat
-          [ text "etaExpandRecord_: the following two constructors should be identical"
+          [ "etaExpandRecord_: the following two constructors should be identical"
           , nest 2 $ text $ "con  = " ++ prettyShow con
           , nest 2 $ text $ "con_ = " ++ prettyShow con_
           ]
@@ -601,12 +701,12 @@ etaExpandRecord'_ forceEta r pars def u = do
     _ -> do
       -- Andreas, < 2016-01-18: Note: recFields are always the original projections,
       -- thus, we can use them in Proj directly.
-      let xs' = for xs $ fmap $ \ x -> u `applyE` [Proj ProjSystem x]
+      let xs' = for (map argFromDom xs) $ fmap $ \ x -> u `applyE` [Proj ProjSystem x]
       reportSDoc "tc.record.eta" 20 $ vcat
-        [ text "eta expanding" <+> prettyTCM u <+> text ":" <+> prettyTCM r
+        [ "eta expanding" <+> prettyTCM u <+> ":" <+> prettyTCM r
         , nest 2 $ vcat
-          [ text "tel' =" <+> prettyTCM tel'
-          , text "args =" <+> prettyTCM xs'
+          [ "tel' =" <+> prettyTCM tel'
+          , "args =" <+> prettyTCM xs'
           ]
         ]
       return (tel', con, ConOSystem, xs')
@@ -622,6 +722,11 @@ etaExpandAtRecordType t u = do
 --   We can eta contract if all fields @f = ...@ are irrelevant
 --   or all fields @f@ are the projection @f v@ of the same value @v@,
 --   but we need at least one relevant field to find the value @v@.
+--
+--   If all fields are erased, we cannot eta-contract.
+
+--   Andreas, 2019-11-06, issue #4168: eta-contraction all-erased record
+--   lead to compilation error.
 
 --   TODO: this can be moved out of TCM.
 --   Andreas, 2018-01-28: attempted just that, but Auto does not
@@ -631,120 +736,190 @@ etaExpandAtRecordType t u = do
 {-# SPECIALIZE etaContractRecord :: QName -> ConHead -> ConInfo -> Args -> TCM Term #-}
 {-# SPECIALIZE etaContractRecord :: QName -> ConHead -> ConInfo -> Args -> ReduceM Term #-}
 etaContractRecord :: HasConstInfo m => QName -> ConHead -> ConInfo -> Args -> m Term
-etaContractRecord r c ci args = do
+etaContractRecord r c ci args = if all (not . usableModality) args then fallBack else do
   Just Record{ recFields = xs } <- isRecord r
-  let check :: Arg Term -> Arg QName -> Maybe (Maybe Term)
-      check a ax = do
-      -- @a@ is the constructor argument, @ax@ the corr. record field name
-        -- skip irrelevant record fields by returning DontCare
-        case (getRelevance a, hasElims $ unArg a) of
-          (Irrelevant, _)   -> Just Nothing
-          -- if @a@ is the record field name applied to a single argument
-          -- then it passes the check
-          (_, Just (_, [])) -> Nothing  -- not a projection
-          (_, Just (h, es)) | Proj _o f <- last es, unArg ax == f
-                            -> Just $ Just $ h $ init es
-          _                 -> Nothing
-      fallBack = return (mkCon c ci args)
+  reportSDoc "tc.record.eta.contract" 20 $ vcat
+    [ "eta contracting record"
+    , nest 2 $ vcat
+      [ "record type r  =" <+> prettyTCM r
+      , "constructor c  =" <+> prettyTCM c
+      , "field names xs =" <+> pretty    xs
+      , "fields    args =" <+> prettyTCM args
+      ]
+    ]
   case compare (length args) (length xs) of
     LT -> fallBack       -- Not fully applied
     GT -> __IMPOSSIBLE__ -- Too many arguments. Impossible.
     EQ -> do
       case zipWithM check args xs of
-        Just as -> case [ a | Just a <- as ] of
+        Just as -> case catMaybes as of
           (a:as) ->
             if all (a ==) as
               then return a
               else fallBack
           _ -> fallBack -- just irrelevant terms
         _ -> fallBack  -- a Nothing
+  where
+  fallBack = return (mkCon c ci args)
+  check :: Arg Term -> Dom QName -> Maybe (Maybe Term)
+  check a ax = do
+  -- @a@ is the constructor argument, @ax@ the corr. record field name
+    -- skip irrelevant record fields by returning DontCare
+    case (getRelevance a, hasElims $ unArg a) of
+      (Irrelevant, _)   -> Just Nothing
+      -- if @a@ is the record field name applied to a single argument
+      -- then it passes the check
+      (_, Just (_, [])) -> Nothing  -- not a projection
+      (_, Just (h, e0:es0))
+        | (es, Proj _o f) <- initLast1 e0 es0
+        , unDom ax == f -> Just $ Just $ h es
+      _                 -> Nothing
 
 -- | Is the type a hereditarily singleton record type? May return a
 -- blocking metavariable.
 --
 -- Precondition: The name should refer to a record type, and the
 -- arguments should be the parameters to the type.
-isSingletonRecord :: QName -> Args -> TCM (Either MetaId Bool)
-isSingletonRecord r ps = mapRight isJust <$> isSingletonRecord' False r ps
+isSingletonRecord :: (PureTCM m, MonadBlock m) => QName -> Args -> m Bool
+isSingletonRecord r ps = isJust <$> isSingletonRecord' False r ps mempty
 
-isSingletonRecordModuloRelevance :: QName -> Args -> TCM (Either MetaId Bool)
-isSingletonRecordModuloRelevance r ps = mapRight isJust <$> isSingletonRecord' True r ps
+isSingletonRecordModuloRelevance :: (PureTCM m, MonadBlock m)
+                                 => QName -> Args -> m Bool
+isSingletonRecordModuloRelevance r ps = isJust <$> isSingletonRecord' True r ps mempty
 
 -- | Return the unique (closed) inhabitant if exists.
 --   In case of counting irrelevance in, the returned inhabitant
 --   contains dummy terms.
-isSingletonRecord' :: Bool -> QName -> Args -> TCM (Either MetaId (Maybe Term))
-isSingletonRecord' regardIrrelevance r ps = do
-  reportSLn "tc.meta.eta" 30 $ "Is " ++ prettyShow r ++ " a singleton record type?"
-  def <- getRecordDef r
-  emap (mkCon (recConHead def) ConOSystem) <$> check (recTel def `apply` ps)
+isSingletonRecord'
+  :: forall m. (PureTCM m, MonadBlock m)
+  => Bool            -- ^ Should disregard irrelevant fields?
+  -> QName           -- ^ Name of record type to check.
+  -> Args            -- ^ Parameters given to the record type.
+  -> Set QName       -- ^ Non-terminating record types we already encountered.
+                     --   These are considered as non-singletons,
+                     --   otherwise we would construct an infinite inhabitant (in an infinite time...).
+  -> m (Maybe Term)  -- ^ The unique inhabitant, if any.  May contain dummy terms in irrelevant positions.
+isSingletonRecord' regardIrrelevance r ps rs = do
+  reportSDoc "tc.meta.eta" 30 $ vcat
+    [ "Is" <+> prettyTCM (Def r $ map Apply ps) <+> "a singleton record type?"
+    , "  already visited:" <+> hsep (map prettyTCM $ Set.toList rs)
+    ]
+  -- Andreas, 2022-03-10, issue #5823
+  -- We need to make sure we are not infinitely unfolding records, so we only expand each once,
+  -- and keep track of the recursive ones we have already seen.
+  if r `Set.member` rs then no else do
+    caseMaybeM (isRecord r) no $ \ def -> do
+      -- We might not know yet whether a record type is recursive because the positivity checker hasn't run yet.
+      -- In this case, we pessimistically consider the record type to be recursive (@True@).
+      let recursive = maybe True (not . null) $ recMutual def
+      -- Andreas, 2022-03-23, issue #5823
+      -- We may pass through terminating record types as often as we want.
+      -- If the termination checker has not run yet, we pessimistically consider the record type
+      -- to be non-terminating.
+      let nonTerminating = maybe True not $ recTerminates def
+      reportSDoc "tc.meta.eta" 30 $ vcat
+        [ hsep [ prettyTCM r, "is recursive      :", prettyTCM recursive      ]
+        , hsep [ prettyTCM r, "is non-terminating:", prettyTCM nonTerminating ]
+        ]
+      fmap (mkCon (recConHead def) ConOSystem) <$> do
+        check (applyWhen (recursive && nonTerminating) (Set.insert r) rs) $ recTel def `apply` ps
   where
-  check :: Telescope -> TCM (Either MetaId (Maybe [Arg Term]))
-  check tel = do
+  -- Check that all entries of the constructor telescope are singletons.
+  check :: Set QName -> Telescope -> m (Maybe [Arg Term])
+  check rs tel = do
     reportSDoc "tc.meta.eta" 30 $
-      text "isSingletonRecord' checking telescope " <+> prettyTCM tel
+      "isSingletonRecord' checking telescope " <+> prettyTCM tel
     case tel of
-      EmptyTel -> return $ Right $ Just []
-      ExtendTel dom tel
-        | isIrrelevantOrProp dom && regardIrrelevance -> do
-          underAbstraction dom tel $ \ tel ->
-            emap (Arg (domInfo dom) __DUMMY_TERM__ :) <$> check tel
-        | otherwise -> do
-          isSing <- isSingletonType' regardIrrelevance $ unDom dom
-          case isSing of
-            Left mid       -> return $ Left mid
-            Right Nothing  -> return $ Right Nothing
-            Right (Just v) -> underAbstraction dom tel $ \ tel ->
-              emap (Arg (domInfo dom) v :) <$> check tel
+      EmptyTel -> yes
+      ExtendTel dom tel -> ifM (return regardIrrelevance `and2M` isIrrelevantOrPropM dom)
+        {-then-}
+          (underAbstraction dom tel $ fmap (fmap (Arg (domInfo dom) __DUMMY_TERM__ :)) . check rs)
+        {-else-} $ do
+          caseMaybeM (isSingletonType' regardIrrelevance (unDom dom) rs) no $ \ v -> do
+            underAbstraction dom tel $ fmap (fmap (Arg (domInfo dom) v :)) . check rs
+  no  = return Nothing
+  yes = return $ Just []
 
 -- | Check whether a type has a unique inhabitant and return it.
 --   Can be blocked by a metavar.
-isSingletonType :: Type -> TCM (Either MetaId (Maybe Term))
-isSingletonType = isSingletonType' False
+isSingletonType :: (PureTCM m, MonadBlock m) => Type -> m (Maybe Term)
+isSingletonType t = isSingletonType' False t mempty
 
 -- | Check whether a type has a unique inhabitant (irrelevant parts ignored).
 --   Can be blocked by a metavar.
-isSingletonTypeModuloRelevance :: (MonadTCM tcm) => Type -> tcm (Either MetaId Bool)
-isSingletonTypeModuloRelevance t = liftTCM $ do
-  mapRight isJust <$> isSingletonType' True t
+isSingletonTypeModuloRelevance :: (PureTCM m, MonadBlock m) => Type -> m Bool
+isSingletonTypeModuloRelevance t = isJust <$> isSingletonType' True t mempty
 
-isSingletonType' :: Bool -> Type -> TCM (Either MetaId (Maybe Term))
-isSingletonType' regardIrrelevance t = do
+isSingletonType'
+  :: forall m. (PureTCM m, MonadBlock m)
+  => Bool            -- ^ Should disregard irrelevant fields?
+  -> Type            -- ^ Type to check.
+  -> Set QName       -- ^ Non-terminating record typess we already encountered.
+                     --   These are considered as non-singletons,
+                     --   otherwise we would construct an infinite inhabitant (in an infinite time...).
+  -> m (Maybe Term)  -- ^ The unique inhabitant, if any.  May contain dummy terms in irrelevant positions.
+isSingletonType' regardIrrelevance t rs = do
     TelV tel t <- telView t
-    ifBlockedType t (\ m _ -> return $ Left m) $ \ _ t -> do
-      res <- isRecordType t
-      case res of
-        Just (r, ps, def) | YesEta <- recEtaEquality def -> do
-          emap (abstract tel) <$> isSingletonRecord' regardIrrelevance r ps
-        _ -> return $ Right Nothing
+    t <- abortIfBlocked t
+    addContext tel $ do
+      let
+        -- Easy case: η for records.
+        record :: m (Maybe Term)
+        record = runMaybeT $ do
+          (r, ps, def) <- MaybeT $ isRecordType t
+          guard (YesEta == recEtaEquality def)
+          abstract tel <$> MaybeT (isSingletonRecord' regardIrrelevance r ps rs)
+
+        -- Slightly harder case: η for Sub {level} tA phi elt.
+        -- tA : Type level, phi : I, elt : Partial phi tA.
+        subtype :: m (Maybe Term)
+        subtype = runMaybeT $ do
+          (level, tA, phi, elt) <- MaybeT $ isCubicalSubtype t
+          subin <- MaybeT $ getBuiltinName' builtinSubIn
+          itIsOne <- MaybeT $ getBuiltinName' builtinIsOne
+          phiV <- intervalView phi
+          case phiV of
+            -- If phi = i1, then inS (elt 1=1) is the only inhabitant.
+            IOne -> do
+              let
+                argH = Arg $ setHiding Hidden defaultArgInfo
+                it = elt `apply` [defaultArg (Def itIsOne [])]
+              pure (Def subin [] `apply` [argH level, argH tA, argH phi, defaultArg it])
+            -- Otherwise we're blocked
+            OTerm phi' -> patternViolation (unblockOnAnyMetaIn phi')
+            -- This fails the MaybeT: we're not looking at a
+            -- definitional singleton.
+            _ -> fail ""
+
+      (<|>) <$> record <*> subtype
 
 -- | Checks whether the given term (of the given type) is beta-eta-equivalent
 --   to a variable. Returns just the de Bruijn-index of the variable if it is,
 --   or nothing otherwise.
-isEtaVar :: Term -> Type -> TCM (Maybe Int)
+isEtaVar :: forall m. PureTCM m => Term -> Type -> m (Maybe Int)
 isEtaVar u a = runMaybeT $ isEtaVarG u a Nothing []
   where
     -- Checks whether the term u (of type a) is beta-eta-equivalent to
     -- `Var i es`, and returns i if it is. If the argument mi is `Just i'`,
     -- then i and i' are also required to be equal (else Nothing is returned).
-    isEtaVarG :: Term -> Type -> Maybe Int -> [Elim' Int] -> MaybeT TCM Int
+    isEtaVarG :: Term -> Type -> Maybe Int -> [Elim' Int] -> MaybeT m Int
     isEtaVarG u a mi es = do
-      (u, a) <- liftTCM $ reduce (u, a)
-      liftTCM $ reportSDoc "tc.lhs" 80 $ text "isEtaVarG" <+> nest 2 (vcat
-        [ text "u  = " <+> text (show u)
-        , text "a  = " <+> prettyTCM a
-        , text "mi = " <+> text (show mi)
-        , text "es = " <+> prettyList (map (text . show) es)
+      (u, a) <- reduce (u, a)
+      reportSDoc "tc.lhs" 80 $ "isEtaVarG" <+> nest 2 (vcat
+        [ "u  = " <+> prettyTCM u
+        , "a  = " <+> prettyTCM a
+        , "mi = " <+> text (show mi)
+        , "es = " <+> prettyList_ (map (prettyTCM . fmap var) es)
         ])
       case (u, unEl a) of
         (Var i' es', _) -> do
           guard $ mi == (i' <$ mi)
-          b <- liftTCM $ typeOfBV i'
+          b <- typeOfBV i'
           areEtaVarElims (var i') b es' es
           return i'
         (_, Def d pars) -> do
-          guard =<< do liftTCM $ isEtaRecord d
-          fs <- liftTCM $ map unArg . recFields . theDef <$> getConstInfo d
+          guard =<< do isEtaRecord d
+          fs <- map unDom . recFields . theDef <$> getConstInfo d
           is <- forM fs $ \f -> do
             let o = ProjSystem
             (_, _, fa) <- MaybeT $ projectTyped u a o f
@@ -764,13 +939,13 @@ isEtaVar u a = runMaybeT $ isEtaVarG u a Nothing []
     -- `areEtaVarElims u a es es'` checks whether the given elims es (as applied
     -- to the term u of type a) are beta-eta-equal to either projections or
     -- variables with de Bruijn indices given by es'.
-    areEtaVarElims :: Term -> Type -> Elims -> [Elim' Int] -> MaybeT TCM ()
+    areEtaVarElims :: Term -> Type -> Elims -> [Elim' Int] -> MaybeT m ()
     areEtaVarElims u a []    []    = return ()
     areEtaVarElims u a []    (_:_) = mzero
     areEtaVarElims u a (_:_) []    = mzero
     areEtaVarElims u a (Proj o f : es) (Proj _ f' : es') = do
       guard $ f == f'
-      a       <- liftTCM $ reduce a
+      a       <- reduce a
       (_, _, fa) <- MaybeT $ projectTyped u a o f
       areEtaVarElims (u `applyE` [Proj o f]) fa es es'
     -- These two cases can occur only when we're looking at two different
@@ -789,10 +964,6 @@ isEtaVar u a = runMaybeT $ isEtaVarG u a Nothing []
       _ <- isEtaVarG (unArg v) (unDom dom) (Just $ unArg i) []
       areEtaVarElims (u `apply` [fmap var i]) (cod `absApp` var (unArg i)) es es'
 
-
--- | Auxiliary function.
-emap :: (a -> b) -> Either c (Maybe a) -> Either c (Maybe b)
-emap = mapRight . fmap
 
 -- | Replace projection patterns by the original projections.
 --
@@ -817,5 +988,7 @@ instance NormaliseProjP (Pattern' x) where
   normaliseProjP p@VarP{}        = return p
   normaliseProjP p@DotP{}        = return p
   normaliseProjP (ConP c cpi ps) = ConP c cpi <$> normaliseProjP ps
+  normaliseProjP (DefP o q ps) = DefP o q <$> normaliseProjP ps
   normaliseProjP p@LitP{}        = return p
   normaliseProjP (ProjP o d0)    = ProjP o <$> getOriginalProjection d0
+  normaliseProjP p@IApplyP{}     = return p

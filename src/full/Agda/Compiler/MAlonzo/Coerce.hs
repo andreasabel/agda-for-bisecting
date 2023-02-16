@@ -1,15 +1,18 @@
 
-module Agda.Compiler.MAlonzo.Coerce (addCoercions) where
+module Agda.Compiler.MAlonzo.Coerce (addCoercions, erasedArity) where
 
+import Agda.Syntax.Common (Nat)
 import Agda.Syntax.Treeless
+
 import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Telescope
-import Agda.TypeChecking.Substitute
-import Agda.Utils.Functor
+  ( HasConstInfo
+  , getErasedConArgs
+  , getTreeless
+  )
 
 -- | Insert unsafeCoerce (in the form of 'TCoerce') everywhere it's needed in
 --   the right-hand side of a definition.
-addCoercions :: TTerm -> TCM TTerm
+addCoercions :: HasConstInfo m => TTerm -> m TTerm
 addCoercions = coerceTop
   where
     -- Don't coerce top-level lambdas.
@@ -66,9 +69,12 @@ addCoercions = coerceTop
         TLet e b       -> TLet <$> softCoerce e <*> softCoerce b
         TCase x t d bs -> TCase x t <$> coerce d <*> mapM coerceAlt bs
 
-funArity :: TTerm -> TCM Int
+funArity :: HasConstInfo m => TTerm -> m Nat
 funArity (TDef q)  = maybe 0 (fst . tLamView) <$> getTreeless q
-funArity (TCon q)  = length . filter not <$> getErasedConArgs q
+funArity (TCon q)  = erasedArity q
 funArity (TPrim _) = return 3 -- max arity of any primitive
 funArity _         = return 0
 
+-- | The number of retained arguments after erasure.
+erasedArity :: HasConstInfo m => QName -> m Nat
+erasedArity q = length . filter not <$> getErasedConArgs q

@@ -1,13 +1,9 @@
--- {-# LANGUAGE CPP #-}
 
 ------------------------------------------------------------------------
 -- | Handling of the INFINITY, SHARP and FLAT builtins.
 ------------------------------------------------------------------------
 
 module Agda.TypeChecking.Rules.Builtin.Coinduction where
-
-import qualified Data.Map as Map
-import qualified Data.Set as Set
 
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Common
@@ -18,7 +14,6 @@ import Agda.Syntax.Scope.Base
 import Agda.TypeChecking.CompiledClause
 import Agda.TypeChecking.Level
 import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Monad.Builtin
 import Agda.TypeChecking.Positivity.Occurrence
 import Agda.TypeChecking.Primitive
 import Agda.TypeChecking.Reduce
@@ -27,7 +22,7 @@ import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Rules.Builtin
 import Agda.TypeChecking.Rules.Term
 
-import Agda.Utils.Permutation
+import Agda.Utils.Lens
 
 -- | The type of @∞@.
 
@@ -55,8 +50,9 @@ typeOfFlat = hPi "a" (el primLevel) $
 -- definition.
 
 bindBuiltinInf :: ResolvedName -> TCM ()
-bindBuiltinInf x = bindPostulatedName builtinInf x $ \inf _ ->
-  instantiateFull =<< checkExpr (A.Def inf) =<< typeOfInf
+bindBuiltinInf x = bindPostulatedName builtinInf x $ \inf _ -> do
+  _ <- checkExpr (A.Def inf) =<< typeOfInf
+  return $ Def inf []
 
 -- | Binds the SHARP builtin, and changes the definitions of INFINITY
 -- and SHARP.
@@ -71,7 +67,7 @@ bindBuiltinSharp x =
   bindPostulatedName builtinSharp x $ \sharp sharpDefn -> do
     sharpType <- typeOfSharp
     TelV fieldTel _ <- telView sharpType
-    sharpE    <- instantiateFull =<< checkExpr (A.Def sharp) sharpType
+    _ <- checkExpr (A.Def sharp) sharpType
     Def inf _ <- primInf
     infDefn   <- getConstInfo inf
     addConstant (defName infDefn) $
@@ -81,30 +77,33 @@ bindBuiltinSharp x =
                   { recPars           = 2
                   , recInduction      = Just CoInductive
                   , recClause         = Nothing
-                  , recConHead        = ConHead sharp CoInductive []  -- flat is added later
+                  , recConHead        = ConHead sharp (IsRecord CopatternMatching) CoInductive []  -- flat is added later
                   , recNamedCon       = True
                   , recFields         = []  -- flat is added later
                   , recTel            = fieldTel
-                  , recEtaEquality'   = Inferred NoEta
+                  , recEtaEquality'   = Inferred $ NoEta CopatternMatching
+                  , recPatternMatching= CopatternMatching
                   , recMutual         = Just []
+                  , recTerminates     = Just True  -- not recursive
                   , recAbstr          = ConcreteDef
-                  , recComp           = Nothing
+                  , recComp           = emptyCompKit
                   }
               }
     addConstant sharp $
       sharpDefn { theDef = Constructor
                     { conPars   = 2
                     , conArity  = 1
-                    , conSrcCon = ConHead sharp CoInductive [] -- flat is added as field later
+                    , conSrcCon = ConHead sharp (IsRecord CopatternMatching) CoInductive [] -- flat is added as field later
                     , conData   = defName infDefn
                     , conAbstr  = ConcreteDef
                     , conInd    = CoInductive
-                    , conComp   = Nothing
+                    , conComp   = emptyCompKit
+                    , conProj   = Nothing
                     , conForced = []
-                    , conErased = []
+                    , conErased = Nothing
                     }
                 }
-    return sharpE
+    return $ Def sharp []
 
 -- | Binds the FLAT builtin, and changes its definition.
 
@@ -116,11 +115,11 @@ bindBuiltinSharp x =
 bindBuiltinFlat :: ResolvedName -> TCM ()
 bindBuiltinFlat x =
   bindPostulatedName builtinFlat x $ \ flat flatDefn -> do
-    flatE       <- instantiateFull =<< checkExpr (A.Def flat) =<< typeOfFlat
+    _ <- checkExpr (A.Def flat) =<< typeOfFlat
     Def sharp _ <- primSharp
     kit         <- requireLevels
     Def inf _   <- primInf
-    let sharpCon = ConHead sharp CoInductive [defaultArg flat]
+    let sharpCon = ConHead sharp (IsRecord CopatternMatching) CoInductive [defaultArg flat]
         level    = El (mkType 0) $ Def (typeName kit) []
         tel     :: Telescope
         tel      = ExtendTel (domH $ level)                  $ Abs "a" $
@@ -138,8 +137,12 @@ bindBuiltinFlat x =
               ConP sharpCon cpi [ argN $ Named Nothing $ debruijnNamedVar "x" 0 ] ]
           , clauseBody      = Just $ var 0
           , clauseType      = Just $ defaultArg $ El (varSort 2) $ var 1
-          , clauseCatchall  = False
+          , clauseCatchall    = False
+          , clauseExact       = Just True
+          , clauseRecursive   = Just False
           , clauseUnreachable = Just False
+          , clauseEllipsis    = NoEllipsis
+          , clauseWhereModule = Nothing
           }
         cc = Case (defaultArg 0) $ conCase sharp False $ WithArity 1 $ Done [defaultArg "x"] $ var 0
         projection = Projection
@@ -152,22 +155,22 @@ bindBuiltinFlat x =
     addConstant flat $
       flatDefn { defPolarity       = []
                , defArgOccurrences = [StrictPos]  -- changing that to [Mixed] destroys monotonicity of 'Rec' in test/succeed/GuardednessPreservingTypeConstructors
-               , theDef = emptyFunction
-                   { funClauses      = [clause]
-                   , funCompiled     = Just $ cc
-                   , funProjection   = Just projection
-                   , funMutual       = Just []
-                   , funTerminates   = Just True
-                   , funCopatternLHS = hasProjectionPatterns cc
+               , defCopatternLHS = hasProjectionPatterns cc
+               , theDef = FunctionDefn emptyFunctionData
+                   { _funClauses      = [clause]
+                   , _funCompiled     = Just $ cc
+                   , _funProjection   = Right projection
+                   , _funMutual       = Just []
+                   , _funTerminates   = Just True
                    }
                 }
 
     -- register flat as record field for constructor sharp
-    modifySignature $ updateDefinition sharp $ updateTheDef $ \ def ->
-      def { conSrcCon = sharpCon }
-    modifySignature $ updateDefinition inf $ updateTheDef $ \ def ->
-      def { recConHead = sharpCon, recFields = [defaultArg flat] }
-    return flatE
+    modifySignature $ updateDefinition sharp $ updateTheDef $ over lensConstructor $ \ def ->
+      def { _conSrcCon = sharpCon }
+    modifySignature $ updateDefinition inf $ updateTheDef $ over lensRecord $ \ def ->
+      def { _recConHead = sharpCon, _recFields = [defaultDom flat] }
+    return $ Def flat []
 
 -- The coinductive primitives.
 -- moved to TypeChecking.Monad.Builtin

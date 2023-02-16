@@ -1,4 +1,3 @@
-{-# LANGUAGE TypeFamilies #-}
 
 -- | Extract used definitions from terms.
 
@@ -7,7 +6,6 @@ module Agda.Syntax.Internal.Defs where
 import Control.Monad.Reader
 import Control.Monad.Writer
 
-import Data.Foldable (Foldable)
 import qualified Data.Foldable as Fold
 
 import Agda.Syntax.Common
@@ -56,7 +54,7 @@ instance GetDefs Clause where
   getDefs = getDefs . clauseBody
 
 instance GetDefs Term where
-  getDefs v = case v of
+  getDefs = \case
     Def d vs   -> doDef d >> getDefs vs
     Con _ _ vs -> getDefs vs
     Lit l      -> return ()
@@ -76,29 +74,26 @@ instance GetDefs Type where
   getDefs (El s t) = getDefs s >> getDefs t
 
 instance GetDefs Sort where
-  getDefs s = case s of
+  getDefs = \case
     Type l    -> getDefs l
     Prop l    -> getDefs l
-    Inf       -> return ()
+    Inf _ _   -> return ()
+    SSet l    -> getDefs l
     SizeUniv  -> return ()
-    PiSort s s' -> getDefs s >> getDefs s'
+    LockUniv  -> return ()
+    IntervalUniv -> return ()
+    PiSort a s1 s2 -> getDefs a >> getDefs s1 >> getDefs s2
+    FunSort s1 s2 -> getDefs s1 >> getDefs s2
     UnivSort s  -> getDefs s
     MetaS x es  -> getDefs x >> getDefs es
+    DefS d es   -> doDef d >> getDefs es
     DummyS{}    -> return ()
 
 instance GetDefs Level where
-  getDefs (Max ls) = getDefs ls
+  getDefs (Max _ ls) = getDefs ls
 
 instance GetDefs PlusLevel where
-  getDefs ClosedLevel{} = return ()
   getDefs (Plus _ l)    = getDefs l
-
-instance GetDefs LevelAtom where
-  getDefs a = case a of
-    MetaLevel x vs   -> getDefs x >> getDefs vs
-    BlockedLevel _ v -> getDefs v
-    NeutralLevel _ v -> getDefs v
-    UnreducedLevel v -> getDefs v
 
 -- collection instances
 
@@ -111,3 +106,11 @@ instance GetDefs a => GetDefs (Abs a)   where
 
 instance (GetDefs a, GetDefs b) => GetDefs (a,b) where
   getDefs (a,b) = getDefs a >> getDefs b
+
+instance GetDefs Telescope where
+  getDefs = getDefs . telToList
+
+-- no defs here
+
+instance {-# OVERLAPPING #-} GetDefs String where
+  getDefs _ = return ()

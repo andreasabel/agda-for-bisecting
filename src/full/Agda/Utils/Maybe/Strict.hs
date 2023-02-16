@@ -1,10 +1,3 @@
-{-# LANGUAGE CPP                #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric      #-}
-
-
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-
 -- | A strict version of the 'Maybe' type.
 --
 --   Import qualified, as in
@@ -20,94 +13,31 @@
 
 module Agda.Utils.Maybe.Strict
   ( module Data.Strict.Maybe
+  , module Data.Strict.Classes
   , module Agda.Utils.Maybe.Strict
   ) where
 
--- The following code is copied from
--- http://hackage.haskell.org/package/strict-base-types-0.3.0/docs/src/Data-Maybe-Strict.html
+import Prelude hiding (Maybe(..), maybe)
 
-import           Prelude             hiding (Maybe (..), maybe, null)
-import qualified Prelude             as Lazy
-
-import           Control.Applicative (pure, (<$>))
-import           Control.DeepSeq     (NFData (..))
-import           Data.Binary         (Binary (..))
-import           Data.Data           (Data (..))
-import           Data.Monoid         (Monoid, mempty, mappend)
-import           Data.Semigroup      (Semigroup, (<>))
-import           Data.Foldable       (Foldable (..))
-import           Data.Traversable    (Traversable (..))
-import           Data.Strict.Maybe   (Maybe (Nothing, Just), fromJust,
-                                      fromMaybe, isJust, isNothing, maybe)
-import           GHC.Generics        (Generic (..))
+import Data.Strict.Classes
+import Data.Strict.Maybe
 
 import Agda.Utils.Null
 
-toStrict :: Lazy.Maybe a -> Maybe a
-toStrict Lazy.Nothing  = Nothing
-toStrict (Lazy.Just x) = Just x
+-- | Note that strict Maybe is an 'Applicative' only modulo strictness.
+--   The laws only hold in the strict semantics.
+--   Eg. @pure f <*> pure _|_ = _|_@, but according to the laws for
+--   'Applicative' it should be @pure (f _|_)@.
+--   We ignore this issue here, it applies also to 'Foldable' and 'Traversable'.
 
-toLazy :: Maybe a -> Lazy.Maybe a
-toLazy Nothing  = Lazy.Nothing
-toLazy (Just x) = Lazy.Just x
-
-deriving instance Data a => Data (Maybe a)
-deriving instance Generic  (Maybe a)
+instance Applicative Maybe where
+  pure              = Just
+  Just f <*> Just x = Just $ f x
+  _      <*> _      = Nothing
 
 instance Null (Maybe a) where
   empty = Nothing
   null = isNothing
-
--- The monoid instance was fixed in strict-base-types 0.5.0. See
--- Issue 1805.
-instance Semigroup a => Semigroup (Maybe a) where
-  Nothing <> m       = m
-  m       <> Nothing = m
-  Just x1 <> Just x2 = Just (x1 <> x2)
-
-instance Semigroup a => Monoid (Maybe a) where
-  mempty  = Nothing
-  mappend = (<>)
-
-instance Foldable Maybe where
-    foldMap _ Nothing  = mempty
-    foldMap f (Just x) = f x
-
-instance Traversable Maybe where
-    traverse _ Nothing  = pure Nothing
-    traverse f (Just x) = Just <$> f x
-
-instance NFData a => NFData (Maybe a) where
-  rnf = rnf . toLazy
-
-instance Binary a => Binary (Maybe a) where
-  put = put . toLazy
-  get = toStrict <$> get
-
--- | Analogous to 'Lazy.listToMaybe' in "Data.Maybe".
-listToMaybe :: [a] -> Maybe a
-listToMaybe []        =  Nothing
-listToMaybe (a:_)     =  Just a
-
--- | Analogous to 'Lazy.maybeToList' in "Data.Maybe".
-maybeToList :: Maybe a -> [a]
-maybeToList  Nothing   = []
-maybeToList  (Just x)  = [x]
-
--- | Analogous to 'Lazy.catMaybes' in "Data.Maybe".
-catMaybes :: [Maybe a] -> [a]
-catMaybes ls = [x | Just x <- ls]
-
--- | Analogous to 'Lazy.mapMaybe' in "Data.Maybe".
-mapMaybe :: (a -> Maybe b) -> [a] -> [b]
-mapMaybe _ []     = []
-mapMaybe f (x:xs) = case f x of
-    Nothing -> rs
-    Just r  -> r:rs
-  where
-    rs = mapMaybe f xs
-
--- The remaining code is a copy of Agda.Utils.Maybe
 
 -- * Collection operations.
 

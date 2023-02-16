@@ -1,7 +1,3 @@
-{-# LANGUAGE BangPatterns               #-}
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 -- | Directed graphs (can of course simulate undirected graphs).
 --
 --   Represented as adjacency maps in direction from source to target.
@@ -46,7 +42,11 @@ module Agda.Utils.Graph.AdjacencyMap.Unidirectional
   , clean
   , removeNode, removeNodes
   , removeEdge
+  , filterNodes
   , filterEdges
+  , filterNodesKeepingEdges
+  , renameNodes, renameNodesMonotonic
+  , WithUniqueInt(..), addUniqueInts
   , unzip
   , composeWith
     -- * Strongly connected components
@@ -61,25 +61,24 @@ module Agda.Utils.Graph.AdjacencyMap.Unidirectional
     -- * Reachability
   , reachableFrom, reachableFromSet
   , walkSatisfying
+  , longestPaths
     -- * Transitive closure
   , gaussJordanFloydWarshallMcNaughtonYamada
   , gaussJordanFloydWarshallMcNaughtonYamadaReference
+  , transitiveClosure
+  , transitiveReduction
   , complete, completeIter
   )
   where
 
-#if MIN_VERSION_base(4,11,0)
-import Prelude hiding ( (<>), lookup, null, unzip )
-#else
 import Prelude hiding ( lookup, null, unzip )
-#endif
 
-import Control.Applicative hiding (empty)
-import Control.Monad
+
+
 
 import qualified Data.Array.IArray as Array
-import qualified Data.Edison.Seq.BankersQueue as BQ
-import qualified Data.Edison.Seq.SimpleQueue as SQ
+import Data.Sequence (Seq)
+import qualified Data.Sequence as Seq
 import Data.Function
 import qualified Data.Graph as Graph
 import Data.IntMap.Strict (IntMap)
@@ -88,24 +87,21 @@ import qualified Data.IntSet as IntSet
 import qualified Data.List as List
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import qualified Data.Maybe as Maybe
+import Data.Foldable (toList)
+
 import Data.Maybe (maybeToList, fromMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Data.Tree as Tree
 
 import Agda.Utils.Function
-import Agda.Utils.Functor
-import Agda.Utils.List (headMaybe)
+
 import Agda.Utils.Null (Null(null))
 import qualified Agda.Utils.Null as Null
 import Agda.Utils.Pretty
 import Agda.Utils.SemiRing
-import Agda.Utils.Singleton (Singleton)
-import qualified Agda.Utils.Singleton as Singleton
 import Agda.Utils.Tuple
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 ------------------------------------------------------------------------
@@ -147,7 +143,7 @@ invariant g =
   Set.isSubsetOf (targetNodes g) (nodes g)
 
 instance (Ord n, Pretty n, Pretty e) => Pretty (Graph n e) where
-  pretty g = vcat (concat $ map pretty' (Set.toAscList (nodes g)))
+  pretty g = vcat (concatMap pretty' (Set.toAscList (nodes g)))
     where
     pretty' n = case edgesFrom g [n] of
       [] -> [pretty n]
@@ -171,7 +167,7 @@ data Edge n e = Edge
 
 instance (Pretty n, Pretty e) => Pretty (Edge n e) where
   pretty (Edge s t e) =
-    pretty s <+> text "--(" <> pretty e <> text ")-->" <+> pretty t
+    pretty s <+> ("--(" <> pretty e <> ")-->") <+> pretty t
 
 ------------------------------------------------------------------------
 -- Queries
@@ -381,7 +377,7 @@ union = unionWith $ \ left right -> left
 -- occur in both graphs (labels from the first graph are given as the
 -- first argument to the function).
 --
--- Time complexity: /O(n₁ log (n₂/n₁ + 1) + e₁ log e₂/, where /n₁/ is
+-- Time complexity: /O(n₁ log (n₂/n₁ + 1) + e₁ log e₂)/, where /n₁/ is
 -- the number of nodes in the graph with the smallest number of nodes
 -- and /n₂/ is the number of nodes in the other graph, and /e₁/ is the
 -- number of edges in the graph with the smallest number of edges and
@@ -436,16 +432,22 @@ transpose g =
 clean :: Null e => Graph n e -> Graph n e
 clean = Graph . Map.map (Map.filter (not . null)) . graph
 
+-- | The graph @filterNodes p g@ contains exactly those nodes from @g@
+-- that satisfy the predicate @p@. Edges to or from nodes that are
+-- removed are also removed. /O(n + e)/.
+
+filterNodes :: Ord n => (n -> Bool) -> Graph n e -> Graph n e
+filterNodes p (Graph g) = Graph (Map.mapMaybeWithKey remSrc g)
+  where
+  remSrc s m
+    | p s       = Just (Map.filterWithKey (\t _ -> p t) m)
+    | otherwise = Nothing
+
 -- | @removeNodes ns g@ removes the nodes in @ns@ (and all
 -- corresponding edges) from @g@. /O((n + e) log |@ns@|)/.
 
 removeNodes :: Ord n => Set n -> Graph n e -> Graph n e
-removeNodes ns (Graph g) = Graph (Map.mapMaybeWithKey remSrc g)
-  where
-  remSrc s m
-    | Set.member s ns = Nothing
-    | otherwise       =
-        Just (Map.filterWithKey (\t _ -> not (Set.member t ns)) m)
+removeNodes ns = filterNodes (\n -> not (Set.member n ns))
 
 -- | @removeNode n g@ removes the node @n@ (and all corresponding
 -- edges) from @g@. /O(n + e)/.
@@ -468,6 +470,134 @@ filterEdges f =
     Map.filterWithKey (\t l ->
       f (Edge { source = s, target = t, label = l }))) .
   graph
+
+-- | Removes the nodes that do not satisfy the predicate from the
+-- graph, but keeps the edges: if there is a path in the original
+-- graph between two nodes that are retained, then there is a path
+-- between these two nodes also in the resulting graph.
+--
+-- Precondition: The graph must be acyclic.
+--
+-- Worst-case time complexity: /O(e n log n)/ (this has not been
+-- verified carefully).
+
+filterNodesKeepingEdges ::
+  forall n e. (Ord n, SemiRing e) =>
+  (n -> Bool) -> Graph n e -> Graph n e
+filterNodesKeepingEdges p g =
+  foldr (insertEdgeWith oplus) (filterNodes p g)
+    (fst edgesToAddAndRemove)
+  where
+  -- The new edges that should be added, and a map from nodes that
+  -- should be removed to edges that should potentially be added
+  -- (after being combined with paths into the nodes that should be
+  -- removed).
+  edgesToAddAndRemove :: ([Edge n e], Map n (Map n e))
+  edgesToAddAndRemove =
+    List.foldl' edgesToAddAndRemoveForSCC ([], Map.empty) (sccs' g)
+
+  edgesToAddAndRemoveForSCC (add, !remove) (Graph.AcyclicSCC n)
+    | p n =
+      ( (do (n', e) <- neighbours n g
+            case Map.lookup n' remove of
+              Nothing -> []
+              Just es ->
+                flip map (Map.toList es) $ \(n', e') -> Edge
+                  { source = n
+                  , target = n'
+                  , label  = e `otimes` e'
+                  })
+          ++
+        add
+      , remove
+      )
+    | otherwise =
+      ( add
+      , Map.insert
+          n
+          (Map.unionsWith oplus $
+           flip map (neighbours n g) $ \(n', e) ->
+             case Map.lookup n' remove of
+               Nothing -> Map.singleton n' e
+               Just es -> fmap (e `otimes`) es)
+          remove
+      )
+  edgesToAddAndRemoveForSCC _ (Graph.CyclicSCC{}) = __IMPOSSIBLE__
+
+-- | Renames the nodes.
+--
+-- Precondition: The renaming function must be injective.
+--
+-- Time complexity: /O((n + e) log n)/.
+
+renameNodes :: Ord n2 => (n1 -> n2) -> Graph n1 e -> Graph n2 e
+renameNodes ren =
+  Graph .
+  fmap (Map.mapKeys ren) .
+  Map.mapKeys ren .
+  graph
+
+-- | Renames the nodes.
+--
+-- Precondition: The renaming function @ren@ must be strictly
+-- increasing (if @x '<' y@ then @ren x '<' ren y@).
+--
+-- Time complexity: /O(n + e)/.
+
+renameNodesMonotonic ::
+  (Ord n1, Ord n2) => (n1 -> n2) -> Graph n1 e -> Graph n2 e
+renameNodesMonotonic ren =
+  Graph .
+  fmap (Map.mapKeysMonotonic ren) .
+  Map.mapKeysMonotonic ren .
+  graph
+
+-- | @WithUniqueInt n@ consists of pairs of (unique) 'Int's and values
+-- of type @n@.
+--
+-- Values of this type are compared by comparing the 'Int's.
+
+data WithUniqueInt n = WithUniqueInt
+  { uniqueInt  :: !Int
+  , otherValue :: !n
+  }
+  deriving (Show, Functor)
+
+instance Eq (WithUniqueInt n) where
+  WithUniqueInt i1 _ == WithUniqueInt i2 _ = i1 == i2
+
+instance Ord (WithUniqueInt n) where
+  compare (WithUniqueInt i1 _) (WithUniqueInt i2 _) = compare i1 i2
+
+instance Pretty n => Pretty (WithUniqueInt n) where
+  pretty (WithUniqueInt i n) =
+    parens ((pretty i <> comma) <+> pretty n)
+
+-- | Combines each node label with a unique 'Int'.
+--
+-- Precondition: The number of nodes in the graph must not be larger
+-- than @'maxBound' :: 'Int'@.
+--
+-- Time complexity: /O(n + e log n)/.
+
+addUniqueInts ::
+  forall n e. Ord n => Graph n e -> Graph (WithUniqueInt n) e
+addUniqueInts g =
+  Graph $
+  Map.fromDistinctAscList $
+  map (\(i, (n, m)) ->
+        (WithUniqueInt i n, Map.mapKeysMonotonic ren m)) $
+  zip [0..] $
+  Map.toAscList $
+  graph g
+  where
+  renaming :: Map n Int
+  renaming = snd $ Map.mapAccum (\i _ -> (succ i, i)) 0 (graph g)
+
+  ren :: n -> WithUniqueInt n
+  ren n = case Map.lookup n renaming of
+    Just i  -> WithUniqueInt i n
+    Nothing -> __IMPOSSIBLE__
 
 -- | Unzips the graph. /O(n + e)/.
 
@@ -503,16 +633,28 @@ composeWith times plus (Graph g) (Graph g') = Graph (Map.map comp g)
 
 -- | The graph's strongly connected components, in reverse topological
 -- order.
+--
+-- The time complexity is likely /O(n + e log n)/ (but this depends on
+-- the, at the time of writing undocumented, time complexity of
+-- 'Graph.stronglyConnComp').
 
 sccs' :: Ord n => Graph n e -> [Graph.SCC n]
 sccs' g =
   Graph.stronglyConnComp
-    [ (n, n, map target (edgesFrom g [n]))
-    | n <- Set.toList (nodes g)
+    [ (n, n, Map.keys es)
+    | (n, es) <- Map.toAscList (graph g)
     ]
+    -- Graph.stronglyConnComp sorts this list, and the sorting
+    -- algorithm that is used is adaptive, so it may make sense to
+    -- generate a sorted list. (These comments apply to one specific
+    -- version of the code in Graph, compiled in a specific way.)
 
 -- | The graph's strongly connected components, in reverse topological
 -- order.
+--
+-- The time complexity is likely /O(n + e log n)/ (but this depends on
+-- the, at the time of writing undocumented, time complexity of
+-- 'Graph.stronglyConnComp').
 
 sccs :: Ord n => Graph n e -> [[n]]
 sccs = map Graph.flattenSCC . sccs'
@@ -556,7 +698,7 @@ dagInvariant g =
     &&
   all isAcyclic (Graph.scc (dagGraph g))
   where
-  isAcyclic (Tree.Node r []) = not (r `elem` (dagGraph g Array.! r))
+  isAcyclic (Tree.Node r []) = r `notElem` (dagGraph g Array.! r)
   isAcyclic _                = False
 
 -- | The opposite DAG.
@@ -572,13 +714,9 @@ reachable g scc = case scc of
   Graph.CyclicSCC (n : _) -> reachable' n
   Graph.CyclicSCC []      -> __IMPOSSIBLE__
   where
-  lookup' g k = case IntMap.lookup k g of
-    Nothing -> __IMPOSSIBLE__
-    Just x  -> x
+  lookup' g k = fromMaybe __IMPOSSIBLE__ (IntMap.lookup k g)
 
-  lookup'' g k = case Map.lookup k g of
-    Nothing -> __IMPOSSIBLE__
-    Just x  -> x
+  lookup'' g k = fromMaybe __IMPOSSIBLE__ (Map.lookup k g)
 
   reachable' n =
     concatMap (Graph.flattenSCC . lookup' (dagComponentMap g)) $
@@ -610,9 +748,7 @@ sccDAG' g sccs = DAG theDAG componentMap secondNodeMap
     IntSet.toList $ IntSet.fromList
       [ j
       | e <- edgesFrom g ns
-      , let j = case Map.lookup (target e) firstNodeMap of
-                  Nothing -> __IMPOSSIBLE__
-                  Just j  -> j
+      , let j = fromMaybe __IMPOSSIBLE__ (Map.lookup (target e) firstNodeMap)
       , j /= i
       ]
 
@@ -623,9 +759,7 @@ sccDAG' g sccs = DAG theDAG componentMap secondNodeMap
       ]
 
   convertInt :: Int -> Graph.Vertex
-  convertInt i = case toVertex i of
-    Nothing -> __IMPOSSIBLE__
-    Just i  -> i
+  convertInt i = fromMaybe __IMPOSSIBLE__ (toVertex i)
 
   componentMap :: IntMap (Graph.SCC n)
   componentMap = IntMap.fromList (map (mapFst convertInt) components)
@@ -675,19 +809,19 @@ reachableFromSet g ns = Map.keysSet (reachableFromInternal g ns)
 reachableFromInternal ::
   Ord n => Graph n e -> Set n -> Map n (Int, [Edge n e])
 reachableFromInternal g ns =
-  bfs (SQ.fromList (map (, BQ.empty) (Set.toList ns))) Map.empty
+  bfs (Seq.fromList (map (, Seq.empty) (toList ns))) Map.empty
   where
-  bfs !q !map = case SQ.lview q of
-    Nothing          -> map
-    Just ((u, p), q) ->
+  bfs !q !map = case Seq.viewl q of
+    Seq.EmptyL -> map
+    (u, p) Seq.:< q ->
       if u `Map.member` map
       then bfs q map
-      else bfs (foldr SQ.rcons q
-                      [ (v, BQ.rcons (Edge u v e) p)
+      else bfs (foldr (flip (Seq.|>)) q
+                      [ (v, p Seq.|> Edge u v e)
                       | (v, e) <- neighbours u g
                       ])
-               (let n = BQ.size p in
-                n `seq` Map.insert u (n, BQ.toList p) map)
+               (let n = Seq.length p in
+                n `seq` Map.insert u (n, toList p) map)
 
 -- | @walkSatisfying every some g from to@ determines if there is a
 -- walk from @from@ to @to@ in @g@, in which every edge satisfies the
@@ -722,6 +856,57 @@ walkSatisfying every some g from to =
 
   reachesTo =
     reachableFrom (fromEdges (map transposeEdge everyEdges)) to
+
+-- | Constructs a graph @g'@ with the same nodes as the original graph
+-- @g@. In @g'@ there is an edge from @n1@ to @n2@ if and only if
+-- there is a (possibly empty) simple path from @n1@ to @n2@ in @g@.
+-- In that case the edge is labelled with all of the longest (in terms
+-- of numbers of edges) simple paths from @n1@ to @n2@ in @g@, as well
+-- as the lengths of these paths.
+--
+-- Precondition: The graph must be acyclic. The number of nodes in the
+-- graph must not be larger than @'maxBound' :: 'Int'@.
+--
+-- Worst-case time complexity (if the paths are not inspected):
+-- /O(e n log n)/ (this has not been verified carefully).
+--
+-- The algorithm is based on one found on Wikipedia.
+
+longestPaths ::
+  forall n e. Ord n => Graph n e -> Graph n (Int, [[Edge n e]])
+longestPaths g =
+  Graph $
+  fmap (fmap (mapSnd toList)) $
+  List.foldl' (flip addLongestFrom) Map.empty $
+  sccs' g
+  where
+  addLongestFrom ::
+    Graph.SCC n ->
+    Map n (Map n (Int, Seq [Edge n e])) ->
+    Map n (Map n (Int, Seq [Edge n e]))
+  addLongestFrom Graph.CyclicSCC{}    !_  = __IMPOSSIBLE__
+  addLongestFrom (Graph.AcyclicSCC n) pss =
+    Map.insert n
+      (Map.insert n (0, Seq.singleton []) $
+       Map.unionsWith longest candidates)
+      pss
+    where
+    longest p1@(n1, ps1) p2@(n2, ps2) = case compare n1 n2 of
+      GT -> p1
+      LT -> p2
+      EQ -> (n1, ps1 Seq.>< ps2)
+
+    candidates :: [Map n (Int, Seq [Edge n e])]
+    candidates =
+      flip map (neighbours n g) $ \(n', e) ->
+      let edge = Edge
+            { source = n
+            , target = n'
+            , label  = e
+            }
+      in case Map.lookup n' pss of
+        Nothing -> Map.empty
+        Just ps -> fmap (succ -*- fmap (edge :)) ps
 
 ------------------------------------------------------------------------
 -- Transitive closure
@@ -879,6 +1064,28 @@ gaussJordanFloydWarshallMcNaughtonYamada g =
       where
       starTimes = otimes (ostar (lookup' k k))
 
-      lookup' s t = case lookup s t g of
-        Nothing -> ozero
-        Just e  -> e
+      lookup' s t = fromMaybe ozero (lookup s t g)
+
+-- | The transitive closure. Using 'gaussJordanFloydWarshallMcNaughtonYamada'.
+--   NOTE: DO NOT USE () AS EDGE LABEL SINCE THIS MEANS EVERY EDGE IS CONSIDERED A ZERO EDGE AND NO
+--         NEW EDGES WILL BE ADDED! Use 'Maybe ()' instead.
+transitiveClosure :: (Ord n, Eq e, StarSemiRing e) => Graph n e -> Graph n e
+transitiveClosure = fst . gaussJordanFloydWarshallMcNaughtonYamada
+
+-- | The transitive reduction of the graph: a graph with the same
+-- reachability relation as the graph, but with as few edges as
+-- possible.
+--
+-- Precondition: The graph must be acyclic. The number of nodes in the
+-- graph must not be larger than @'maxBound' :: 'Int'@.
+--
+-- Worst-case time complexity: /O(e n log n)/ (this has not been
+-- verified carefully).
+--
+-- The algorithm is based on one found on Wikipedia.
+
+transitiveReduction :: Ord n => Graph n e -> Graph n ()
+transitiveReduction g =
+  fmap (const ()) $
+  filterEdges ((== 1) . fst . label) $
+  longestPaths g

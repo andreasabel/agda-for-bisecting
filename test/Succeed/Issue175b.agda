@@ -11,15 +11,16 @@ data Bool : Set where
 {-# BUILTIN TRUE true #-}
 {-# BUILTIN FALSE false #-}
 
+postulate ℝ : Set
 {-# BUILTIN FLOAT ℝ #-}
 
 primitive
   -- ℝ functions
   primFloatMinus : ℝ -> ℝ -> ℝ
-  primFloatNumericalLess : ℝ -> ℝ -> Bool
+  primFloatLess : ℝ -> ℝ -> Bool
 
 _<_ : ℝ -> ℝ -> Bool
-a < b = primFloatNumericalLess a b
+a < b = primFloatLess a b
 
 data _≤_ : ℝ -> ℝ -> Set where
    ≤_ : {x y : ℝ} -> (x < y) ≡ true -> x ≤ y

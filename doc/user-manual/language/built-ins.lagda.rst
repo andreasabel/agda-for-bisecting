@@ -1,14 +1,12 @@
 ..
   ::
-  {-# OPTIONS --rewriting #-}
+  {-# OPTIONS --rewriting --sized-types #-}
   module language.built-ins where
 
   open import Agda.Builtin.Equality public
+  open import Agda.Primitive
 
-  data Maybe (A : Set) : Set where
-    just : A → Maybe A
-    nothing : Maybe A
-
+  postulate String : Set
   {-# BUILTIN STRING String #-}
 
   data ⊥ : Set where
@@ -70,6 +68,94 @@ The unit type is bound to the built-in ``UNIT`` as follows::
 Agda needs to know about the unit type since some of the primitive operations
 in the :ref:`reflected type checking monad <reflection-tc-monad>` return values
 in the unit type.
+
+.. _built-in-sigma:
+
+The Σ-type
+----------
+
+.. code-block:: agda
+
+  module Agda.Builtin.Sigma
+
+The built-in ``Σ``-type of dependent pairs is defined as follows::
+
+  record Σ {a b} (A : Set a) (B : A → Set b) : Set (a ⊔ b) where
+    constructor _,_
+    field
+      fst : A
+      snd : B fst
+
+  open Σ public
+
+  infixr 4 _,_
+
+  {-# BUILTIN SIGMA Σ #-}
+
+
+.. _built-in-list:
+
+Lists
+-----
+
+.. code-block:: agda
+
+  module Agda.Builtin.List
+
+Built-in lists are bound using the ``LIST`` built-in::
+
+  data List {a} (A : Set a) : Set a where
+    []  : List A
+    _∷_ : (x : A) (xs : List A) → List A
+  {-# BUILTIN LIST List #-}
+  infixr 5 _∷_
+
+The constructors are bound automatically when binding the type. Lists are not
+required to be level polymorphic; ``List : Set → Set`` is also accepted.
+
+As with booleans, the effect of binding the ``LIST`` built-in is to let
+you use primitive functions working with lists, such as ``primStringToList``
+and ``primStringFromList``, and letting the :ref:`GHC backend <ghc-backend>`
+know to compile the List type to Haskell lists.
+
+..
+  ::
+  -- common functions on lists used in other files for examples
+  _++_ : ∀ {a} {A : Set a} → List A → List A → List A
+  [] ++ ys       = ys
+  (x ∷ xs) ++ ys = x ∷ (xs ++ ys)
+
+  map : ∀ {a b} {A : Set a} {B : Set b} → (A → B) → List A → List B
+  map f []       = []
+  map f (x ∷ xs) = f x ∷ map f xs
+
+  [_] : ∀ {a} {A : Set a} → A → List A
+  [ x ] = x ∷ []
+
+.. _built-in-maybe:
+
+Maybe
+-----
+
+.. code-block:: agda
+
+  module Agda.Builtin.Maybe
+
+Built-in maybe type is bound using the ``MAYBE`` built-in::
+
+  data Maybe {a} (A : Set a) : Set a where
+    nothing : Maybe A
+    just    : A → Maybe A
+  {-# BUILTIN MAYBE Maybe #-}
+
+The constructors are bound automatically when binding the type. Maybe is not
+required to be level polymorphic; ``Maybe : Set → Set`` is also accepted.
+
+As with list, the effect of binding the ``MAYBE`` built-in is to let
+you use primitive functions working with maybes, such as ``primStringUncons``
+that returns the head and tail of a string (if it is non empty), and letting
+the :ref:`GHC backend <ghc-backend>` know to compile the Maybe type to Haskell
+maybes.
 
 .. _built-in-bool:
 
@@ -210,9 +296,11 @@ Machine words
 .. code-block:: agda
 
   module Agda.Builtin.Word
+  module Agda.Builtin.Word.Properties
 
 Agda supports built-in 64-bit machine words, bound with the ``WORD64`` built-in::
 
+  postulate Word64 : Set
   {-# BUILTIN WORD64 Word64 #-}
 
 Machine words can be converted to and from natural numbers using the following primitives::
@@ -222,12 +310,17 @@ Machine words can be converted to and from natural numbers using the following p
     primWord64FromNat : Nat → Word64
 
 Converting to a natural number is the trivial embedding, and converting from a natural number
-gives you the remainder modulo :math:`2^{64}`. The proofs of these theorems are not primitive,
+gives you the remainder modulo :math:`2^{64}`. The proof of the former theorem::
+
+  primitive
+    primWord64ToNatInjective : ∀ a b → primWord64ToNat a ≡ primWord64ToNat b → a ≡ b
+
+is in the ``Properties`` module. The proof of the latter theorem is not primitive,
 but can be defined in a library using :ref:`primTrustMe`.
 
 
 Basic arithmetic operations can be defined on ``Word64`` by converting to
-natural numbers, peforming the corresponding operation, and then converting
+natural numbers, performing the corresponding operation, and then converting
 back. The compiler will optimise these to use 64-bit arithmetic. For
 instance::
 
@@ -280,9 +373,11 @@ Floats
 .. code-block:: agda
 
   module Agda.Builtin.Float
+  module Agda.Builtin.Float.Properties
 
 Floating point numbers are bound with the ``FLOAT`` built-in::
 
+  postulate Float : Set
   {-# BUILTIN FLOAT Float #-}
 
 This lets you use :ref:`floating point literals
@@ -291,32 +386,45 @@ type checker as IEEE 754 binary64 double precision floats, with the
 restriction that there is exactly one NaN value. The following
 primitive functions are available (with suitable bindings for
 :ref:`Nat <built-in-nat>`, :ref:`Bool <built-in-bool>`,
-:ref:`String <built-in-string>` and :ref:`Int <built-in-integer>`)::
+:ref:`String <built-in-string>`, :ref:`Int <built-in-integer>`,
+:ref:`Maybe_<built-in-maybe>`)::
 
   primitive
+    -- Relations
+    primFloatIsInfinite        : Float → Bool
+    primFloatIsNaN             : Float → Bool
+    primFloatIsNegativeZero    : Float → Bool
+
+    -- Conversions
     primNatToFloat             : Nat → Float
+    primIntToFloat             : Int → Float
+    primFloatToRatio           : Float → (Σ Int λ _ → Int)
+    primRatioToFloat           : Int → Int → Float
+    primShowFloat              : Float → String
+
+    -- Operations
     primFloatPlus              : Float → Float → Float
     primFloatMinus             : Float → Float → Float
     primFloatTimes             : Float → Float → Float
-    primFloatNegate            : Float → Float
     primFloatDiv               : Float → Float → Float
-    primFloatEquality          : Float → Float → Bool
-    primFloatLess              : Float → Float → Bool
-    primFloatNumericalEquality : Float → Float → Bool
-    primFloatNumericalLess     : Float → Float → Bool
-    primRound                  : Float → Int
-    primFloor                  : Float → Int
-    primCeiling                : Float → Int
-    primExp                    : Float → Float
-    primLog                    : Float → Float
-    primSin                    : Float → Float
-    primCos                    : Float → Float
-    primTan                    : Float → Float
-    primASin                   : Float → Float
-    primACos                   : Float → Float
-    primATan                   : Float → Float
-    primATan2                  : Float → Float → Float
-    primShowFloat              : Float → String
+    primFloatPow               : Float → Float → Float
+    primFloatNegate            : Float → Float
+    primFloatSqrt              : Float → Float
+    primFloatExp               : Float → Float
+    primFloatLog               : Float → Float
+    primFloatSin               : Float → Float
+    primFloatCos               : Float → Float
+    primFloatTan               : Float → Float
+    primFloatASin              : Float → Float
+    primFloatACos              : Float → Float
+    primFloatATan              : Float → Float
+    primFloatATan2             : Float → Float → Float
+    primFloatSinh              : Float → Float
+    primFloatCosh              : Float → Float
+    primFloatTanh              : Float → Float
+    primFloatASinh             : Float → Float
+    primFloatACosh             : Float → Float
+    primFloatATanh             : Float → Float
 
 ..
   ::
@@ -339,81 +447,48 @@ primitive functions are available (with suitable bindings for
     not false = true
     not true  = false
 
-The ``primFloatEquality`` primitive is intended to be used for decidable
-propositional equality. To enable proof carrying comparisons while preserving
-consistency, the following laws apply::
+The primitive binary relations implement their IEEE 754 equivalents, which means
+that ``primFloatEquality`` is not reflexive, and ``primFloatInequality`` and
+``primFloatLess`` are not total. (Specifically, NaN is not related to anything,
+including itself.)
 
-  nan=nan : primFloatEquality NaN NaN ≡ true
-  nan=nan = refl
+The ``primFloatIsSafeInteger`` function determines whether the value is a number
+that is a safe integer, i.e., is within the range where the arithmetic
+operations do not lose precision.
 
-  nan=-nan : primFloatEquality NaN (primFloatNegate NaN) ≡ true
-  nan=-nan = refl
+Floating point numbers can be converted to their raw representation using the primitive::
 
-  neg0≠0 : primFloatEquality 0.0 -0.0 ≡ false
-  neg0≠0 = refl
+  primitive
+    primFloatToWord64          : Float → Maybe Word64
 
-Correspondingly, the ``primFloatLess`` can be used to provide a decidable total order,
-given by the following laws::
+which returns ``nothing`` for ``NaN`` and satisfies::
 
-  _[<]_ : Float → Float → Set
-  x [<] y = primFloatLess x y && not (primFloatLess y x) ≡ true
+    primFloatToWord64Injective : ∀ a b → primFloatToWord64 a ≡ primFloatToWord64 b → a ≡ b
 
-  -inf<nan : -Inf [<]  NaN
-  nan<neg  :  NaN [<] -1.0
-  neg<neg0 : -1.0 [<] -0.0
-  neg0<0   : -0.0 [<]  0.0
-  0<pos    :  0.0 [<]  1.0
-  pos<Inf  :  1.0 [<]  Inf
+in the ``Properties`` module. These primitives can be used to define a safe
+decidable propositional equality with the :option:`--safe` option. The function
+``primFloatToWord64`` cannot be guaranteed to be consistent across backends,
+therefore relying on the specific result may result in inconsistencies.
 
-  -inf<nan = refl
-  nan<neg  = refl
-  neg<neg0 = refl
-  neg0<0   = refl
-  0<pos    = refl
-  pos<Inf  = refl
+The rounding operations (``primFloatRound``, ``primFloatFloor``, and
+``primFloatCeiling``) return a value of type ``Maybe Int``, and return ``nothing``
+when applied to NaN or the infinities::
 
-For numerical comparisons, use the ``primFloatNumericalEquality`` and
-``primFloatNumericalLess`` primitives. These are implemented by the
-corresponding IEEE functions.
+  primitive
+    primFloatRound             : Float → Maybe Int
+    primFloatFloor             : Float → Maybe Int
+    primFloatCeiling           : Float → Maybe Int
 
-.. _built-in-list:
+The ``primFloatDecode`` function decodes a floating-point number to its mantissa
+and exponent, normalised such that the mantissa is the smallest possible
+integer. It fails when applied to NaN or the infinities, returning ``nothing``.
+The ``primFloatEncode`` function encodes a pair of a mantissa and exponent to a
+floating-point number. It fails when the resulting number cannot be represented
+as a float. Note that ``primFloatEncode`` may result in a loss of precision.
 
-Lists
------
-
-.. code-block:: agda
-
-  module Agda.Builtin.List
-
-Built-in lists are bound using the ``LIST`` built-in::
-
-  data List {a} (A : Set a) : Set a where
-    []  : List A
-    _∷_ : (x : A) (xs : List A) → List A
-  {-# BUILTIN LIST List #-}
-  infixr 5 _∷_
-
-The constructors are bound automatically when binding the type. Lists are not
-required to be level polymorphic; ``List : Set → Set`` is also accepted.
-
-As with booleans, the effect of binding the ``LIST`` built-in is to let
-you use primitive functions working with lists, such as ``primStringToList``
-and ``primStringFromList``, and letting the :ref:`GHC backend <ghc-backend>`
-know to compile the List type to Haskell lists.
-
-..
-  ::
-  -- common functions on lists used in other files for examples
-  _++_ : ∀ {a} {A : Set a} → List A → List A → List A
-  [] ++ ys       = ys
-  (x ∷ xs) ++ ys = x ∷ (xs ++ ys)
-
-  map : ∀ {a b} {A : Set a} {B : Set b} → (A → B) → List A → List B
-  map f []       = []
-  map f (x ∷ xs) = f x ∷ map f xs
-
-  [_] : ∀ {a} {A : Set a} → A → List A
-  [ x ] = x ∷ []
+  primitive
+    primFloatDecode            : Float → Maybe (Σ Int λ _ → Int)
+    primFloatEncode            : Int → Int → Maybe Float
 
 
 .. _built-in-char:
@@ -424,9 +499,11 @@ Characters
 .. code-block:: agda
 
   module Agda.Builtin.Char
+  module Agda.Builtin.Char.Properties
 
 The character type is bound with the ``CHARACTER`` built-in::
 
+  postulate Char : Set
   {-# BUILTIN CHAR Char #-}
 
 Binding the character type lets you use :ref:`character literals
@@ -453,9 +530,19 @@ are available on characters (given suitable bindings for
 These functions are implemented by the corresponding Haskell functions from
 `Data.Char <data-char_>`_ (``ord`` and ``chr`` for ``primCharToNat`` and
 ``primNatToChar``). To make ``primNatToChar`` total ``chr`` is applied to the
-natural number modulo ``0x110000``.
+natural number modulo ``0x110000``. Furthermore, to match the behaviour of
+strings, `surrogate code points <surrogate_>`_ are mapped to the replacement
+character ``U+FFFD``.
+
+Converting to a natural number is the obvious embedding, and its proof::
+
+  primitive
+    primCharToNatInjective : ∀ a b → primCharToNat a ≡ primCharToNat b → a ≡ b
+
+can be found in the ``Properties`` module.
 
 .. _data-char: https://hackage.haskell.org/package/base-4.8.1.0/docs/Data-Char.html
+.. _surrogate: https://www.unicode.org/glossary/#surrogate_code_point
 
 .. _built-in-string:
 
@@ -465,11 +552,13 @@ Strings
 .. code-block:: agda
 
   module Agda.Builtin.String
+  module Agda.Builtin.String.Properties
 
 The string type is bound with the ``STRING`` built-in:
 
 .. code-block:: agda
 
+  postulate String : Set
   {-# BUILTIN STRING String #-}
 
 Binding the string type lets you use :ref:`string literals
@@ -478,13 +567,27 @@ functions are available on strings (given suitable bindings for
 :ref:`Bool <built-in-bool>`, :ref:`Char <built-in-char>` and
 :ref:`List <built-in-list>`)::
 
-  primitive primStringToList   : String → List Char
-  primitive primStringFromList : List Char → String
-  primitive primStringAppend   : String → String → String
-  primitive primStringEquality : String → String → Bool
-  primitive primShowString     : String → String
+  primitive
+    primStringUncons   : String → Maybe (Σ Char (λ _ → String))
+    primStringToList   : String → List Char
+    primStringFromList : List Char → String
+    primStringAppend   : String → String → String
+    primStringEquality : String → String → Bool
+    primShowString     : String → String
 
 String literals can be :ref:`overloaded <overloaded-strings>`.
+
+Converting to and from a list is injective, and their proofs::
+
+  primitive
+    primStringToListInjective : ∀ a b → primStringToList a ≡ primStringToList b → a ≡ b
+    primStringFromListInjective : ∀ a b → primStringFromList a ≡ primStringFromList b → a ≡ b
+
+can found in the ``Properties`` module.
+
+Strings cannot represent `unicode surrogate code points <surrogate_>`_
+(characters in the range ``U+D800`` to ``U+DFFF``). These are replaced by the
+unicode replacement character ``U+FFFD`` if they appear in string literals.
 
 .. _built-in-equality:
 
@@ -514,7 +617,25 @@ Other variants of the identity type are also accepted as built-in:
   data _≡_ {A : Set} : (x y : A) → Set where
     refl : (x : A) → x ≡ x
 
-The type of ``primTrustMe`` has to match the flavor of identity type.
+The type of ``primEraseEquality`` has to match the flavor of identity type.
+
+.. _primEraseEquality:
+
+.. code-block:: agda
+
+  module Agda.Builtin.Equality.Erase
+
+Binding the built-in equality type also enables the ``primEraseEquality`` primitive::
+
+  primitive
+    primEraseEquality : ∀ {a} {A : Set a} {x y : A} → x ≡ y → x ≡ y
+
+The function takes a proof of an equality between two values ``x`` and ``y`` and stays
+stuck on it until ``x`` and ``y`` actually become definitionally equal. Whenever that
+is the case, ``primEraseEquality e`` reduces to ``refl``.
+
+One use of ``primEraseEquality`` is to replace an equality proof computed using an expensive
+function (e.g. a proof by reflection) by one which is trivially ``refl`` on the diagonal.
 
 .. _primtrustme:
 
@@ -525,13 +646,14 @@ primTrustMe
 
   module Agda.Builtin.TrustMe
 
-Binding the built-in equality type also enables the ``primTrustMe`` primitive::
+From the ``primEraseEquality`` primitive, we can derive a notion of ``primTrustMe``::
 
-  primitive
-    primTrustMe : ∀ {a} {A : Set a} {x y : A} → x ≡ y
+  primTrustMe : ∀ {a} {A : Set a} {x y : A} → x ≡ y
+  primTrustMe {x = x} {y} = primEraseEquality unsafePrimTrustMe
+    where postulate unsafePrimTrustMe : x ≡ y
 
 As can be seen from the type, ``primTrustMe`` must be used with the
-utmost care to avoid inconsistencies.  What makes it different from a
+utmost care to avoid inconsistencies. What makes it different from a
 postulate is that if ``x`` and ``y`` are actually definitionally
 equal, ``primTrustMe`` reduces to ``refl``. One use of ``primTrustMe``
 is to lift the primitive boolean equality on built-in types like
@@ -544,11 +666,30 @@ object::
                  else nothing
 
 With this definition ``eqString "foo" "foo"`` computes to ``just refl``.
-Another use case is to erase computationally expensive equality proofs and
-replace them by ``primTrustMe``::
 
-  eraseEquality : ∀ {a} {A : Set a} {x y : A} → x ≡ y → x ≡ y
-  eraseEquality _ = primTrustMe
+
+Sorts
+-----
+
+The primitive sorts used in Agda's type system (`Set`, `Prop`, and
+`Setω`) are declared using ``BUILTIN`` pragmas in the
+``Agda.Primitive`` module. These pragmas should not be used directly
+in other modules, but it is possible to rename these builtin sorts
+when importing ``Agda.Primitive``.
+
+..
+  This code cannot be typechecked because the identifiers are already bound
+  in Agda.Primitive and are auto-imported.
+
+.. code-block:: agda
+
+  {-# BUILTIN TYPE Set #-}
+  {-# BUILTIN PROP Prop #-}
+  {-# BUILTIN SETOMEGA Setω #-}
+
+The primitive sorts `Set` and `Prop` are automatically imported at the
+top of every top-level Agda module, unless the
+:option:`--no-import-sorts` flag is enabled.
 
 Universe levels
 ---------------
@@ -560,19 +701,19 @@ Universe levels
 :ref:`Universe levels <universe-levels>` are also declared using ``BUILTIN``
 pragmas. In contrast to the ``Agda.Builtin`` modules, the ``Agda.Primitive`` module
 is auto-imported and thus it is not possible to change the level built-ins. For
-reference these are the bindings::
-
-  postulate
-    Level : Set
-    lzero : Level
-    lsuc  : Level → Level
-    _⊔_   : Level → Level → Level
+reference these are the bindings:
 
 ..
   This code cannot be typechecked because the identifiers are already bound
   in Agda.Primitive and are auto-imported.
 
 .. code-block:: agda
+
+  postulate
+    Level : Set
+    lzero : Level
+    lsuc  : Level → Level
+    _⊔_   : Level → Level → Level
 
   {-# BUILTIN LEVEL     Level #-}
   {-# BUILTIN LEVELZERO lzero #-}
@@ -616,6 +757,10 @@ Coinduction
 
 The following built-ins are used for coinductive definitions::
 
+    postulate
+      ∞  : ∀ {a} (A : Set a) → Set a
+      ♯_ : ∀ {a} {A : Set a} → A → ∞ A
+      ♭  : ∀ {a} {A : Set a} → ∞ A → A
     {-# BUILTIN INFINITY ∞  #-}
     {-# BUILTIN SHARP    ♯_ #-}
     {-# BUILTIN FLAT     ♭  #-}
@@ -659,6 +804,8 @@ Reflection
 The reflection machinery has built-in types for representing Agda programs. See
 :doc:`reflection` for a detailed description.
 
+.. _builtin-rewrite:
+
 Rewriting
 ---------
 
@@ -669,8 +816,9 @@ to be confused with the :ref:`rewrite construct <with-rewrite>`) has a built-in
   postulate _↦_ : ∀ {a} {A : Set a} → A → A → Set a
   {-# BUILTIN REWRITE _↦_ #-}
 
-There is no ``Agda.Builtin`` module for the rewrite relation since different
-rewriting experiments typically want different relations.
+This builtin is bound to the :ref:`builtin equality type
+<built-in-equality>` from ``Agda.Builtin.Equality`` in
+``Agda.Builtin.Equality.Rewrite``.
 
 Static values
 -------------

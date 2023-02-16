@@ -1,20 +1,23 @@
--- {-# LANGUAGE CPP #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Agda.Interaction.AgdaTop
     ( repl
     ) where
 
-import Control.Monad.State
+import Control.Monad                ( unless )
+import Control.Monad.IO.Class       ( MonadIO(..) )
+import Control.Monad.State          ( evalStateT, runStateT )
+import Control.Monad.Trans          ( lift )
+
 import Data.Char
+import Data.Maybe
 import System.IO
 
+import Agda.Interaction.Base
+import Agda.Interaction.ExitCode
 import Agda.Interaction.Response as R
 import Agda.Interaction.InteractionTop
 import Agda.Interaction.Options
 import Agda.TypeChecking.Monad
 import qualified Agda.TypeChecking.Monad.Benchmark as Bench
-import Agda.Utils.Maybe
 
 ----------------------------------
 
@@ -47,13 +50,17 @@ repl callback prompt setup = do
       liftIO $ do
         putStr prompt
         hFlush stdout
-      c <- nextCommand
-      case c of
+      r <- maybeAbort runInteraction
+      case r of
         Done      -> return True -- Done.
-        Error s   -> liftIO (putStrLn s) >> return False
-        Command c -> do
-          maybeAbort (runInteraction c)
-          return False
+        Command _ -> return False
+        Error s   -> do
+          exit <- optExitOnError <$> commandLineOptions
+          if exit
+            then liftIO (exitAgdaWith CommandError)
+            else do
+              liftIO (putStrLn s)
+              return False
 
     lift Bench.print
     unless done interact'
@@ -71,7 +78,6 @@ repl callback prompt setup = do
       case dropWhile isSpace r of
         ""          -> readCommand
         ('-':'-':_) -> readCommand
-        _           -> case listToMaybe $ reads r of
-          Just (x, "")  -> return $ Command x
-          Just (_, rem) -> return $ Error $ "not consumed: " ++ rem
-          _             -> return $ Error $ "cannot read: " ++ r
+        _           -> case parseIOTCM r of
+          Right cmd -> return $ Command cmd
+          Left err  -> return $ Error err

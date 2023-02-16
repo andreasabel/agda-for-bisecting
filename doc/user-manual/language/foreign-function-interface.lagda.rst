@@ -111,6 +111,22 @@ The compiler checks that the types of the Agda constructors match the types of t
 corresponding Haskell constructors and that no constructors have been left out
 (on either side).
 
+Record types
+^^^^^^^^^^^^
+
+The ``data`` form of the ``COMPILE`` pragma also works with Agda's record types::
+
+  import Agda.Builtin.List
+  {-# FOREIGN GHC import Data.Tree #-}
+
+  record Tree (A : Set) : Set where
+    inductive
+    constructor node
+    field root-label : A
+    field sub-forest : Agda.Builtin.List.List (Tree A)
+
+  {-# COMPILE GHC Tree = data Tree (Node) #-}
+
 Built-in Types
 ^^^^^^^^^^^^^^
 
@@ -145,7 +161,7 @@ Using Haskell functions from Agda
 ---------------------------------
 
 Once a suitable mapping between Haskell types and Agda types has been set
-up, Haskell functions whose types map to an Agda type can be exposed to Agda
+up, Haskell functions whose types map to Agda types can be exposed to Agda
 code with a ``COMPILE`` pragma::
 
   open import Agda.Builtin.IO
@@ -235,9 +251,9 @@ Level-polymorphic types
 
 :ref:`Level-polymorphic types <universe-levels>` face a similar problem to
 polymorphic functions. Since Haskell does not have universe levels the Agda
-type will have more arguments than the corresponding type. This can be solved
+type will have more arguments than the corresponding Haskell type. This can be solved
 by defining a Haskell type synonym with the appropriate number of phantom
-arguments. For instance
+arguments. For instance:
 
 ::
 

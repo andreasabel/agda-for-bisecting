@@ -1,9 +1,3 @@
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE DeriveGeneric              #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE NoMonomorphismRestriction  #-}
-
 {-| Position information for syntax. Crucial for giving good error messages.
 -}
 
@@ -13,6 +7,8 @@ module Agda.Syntax.Position
   , PositionWithoutFile
   , Position'(..)
   , SrcFile
+  , RangeFile(..)
+  , mkRangeFile
   , positionInvariant
   , startPos
   , movePos
@@ -26,8 +22,6 @@ module Agda.Syntax.Position
   , Interval'(..)
   , intervalInvariant
   , posToInterval
-  , takeI
-  , dropI
   , getIntervalFile
   , iLength
   , fuseIntervals
@@ -42,6 +36,8 @@ module Agda.Syntax.Position
   , intervalToRange
   , rangeIntervals
   , rangeFile
+  , rangeModule'
+  , rangeModule
   , rightMargin
   , noRange
   , posToRange, posToRange'
@@ -68,41 +64,39 @@ module Agda.Syntax.Position
   , interleaveRanges
   ) where
 
-#if MIN_VERSION_base(4,11,0)
-import Prelude hiding ( (<>), null )
-#else
 import Prelude hiding ( null )
-#endif
 
-import Control.Applicative hiding (empty)
+import Control.DeepSeq
 import Control.Monad
-import Control.Monad.Writer (runWriter, Writer, tell)
+import Control.Monad.Writer (runWriter, tell)
 
-import Data.Foldable (Foldable)
 import qualified Data.Foldable as Fold
 import Data.Function
 import Data.Int
-import Data.List hiding (null)
+import Data.List (sort)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.Traversable (Traversable)
-import Data.Data (Data)
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
+import Data.Semigroup (Semigroup(..))
 import Data.Void
 
 import GHC.Generics (Generic)
 
+import {-# SOURCE #-} Agda.Syntax.TopLevelModuleName
+  (TopLevelModuleName)
+
 import Agda.Utils.FileName
 import Agda.Utils.List
+import Agda.Utils.List1 (List1)
+import Agda.Utils.List2 (List2)
 import qualified Agda.Utils.Maybe.Strict as Strict
-import Agda.Utils.NonemptyList
 import Agda.Utils.Null
+import Agda.Utils.Permutation
 import Agda.Utils.Pretty
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 {--------------------------------------------------------------------------
@@ -128,7 +122,7 @@ data Position' a = Pn
   , posCol  :: !Int32
     -- ^ Column number, counting from 1.
   }
-  deriving (Data, Functor, Foldable, Traversable, Generic)
+  deriving (Show, Functor, Foldable, Traversable, Generic)
 
 positionInvariant :: Position' a -> Bool
 positionInvariant p =
@@ -143,19 +137,73 @@ instance Eq a => Eq (Position' a) where
 instance Ord a => Ord (Position' a) where
   compare = compare `on` importantPart
 
-type SrcFile = Strict.Maybe AbsolutePath
+type SrcFile = Strict.Maybe RangeFile
+
+-- | File information used in the 'Position', 'Interval' and 'Range'
+-- types.
+data RangeFile = RangeFile
+  { rangeFilePath :: !AbsolutePath
+    -- ^ The file's path.
+  , rangeFileName :: !(Maybe TopLevelModuleName)
+    -- ^ The file's top-level module name.
+    --
+    -- This field is optional, but some things may break if the field
+    -- is not instantiated with an actual top-level module name. For
+    -- instance, the 'Eq' and 'Ord' instances only make use of this
+    -- field.
+    --
+    -- The field uses 'Maybe' rather than 'Strict.Maybe' because it
+    -- should be possible to instantiate it with something that is not
+    -- yet defined (see 'Agda.Interaction.Imports.parseSource').
+    --
+    -- This 'TopLevelModuleName' should not contain a range.
+  }
+  deriving (Show, Generic)
+
+-- | A smart constructor for 'RangeFile'.
+
+mkRangeFile :: AbsolutePath -> Maybe TopLevelModuleName -> RangeFile
+mkRangeFile f top = RangeFile
+  { rangeFilePath = f
+  , rangeFileName = killRange top
+  }
+
+-- | Only the 'rangeFileName' component is compared.
+
+instance Eq RangeFile where
+  (==) = (==) `on` rangeFileName
+
+-- | Only the 'rangeFileName' component is compared.
+
+instance Ord RangeFile where
+  compare = compare `on` rangeFileName
+
+instance NFData RangeFile where
+  rnf (RangeFile _ n) = rnf n
 
 type Position            = Position' SrcFile
 type PositionWithoutFile = Position' ()
+
+instance NFData Position where
+  rnf = (`seq` ())
+
+instance NFData PositionWithoutFile where
+  rnf = (`seq` ())
 
 -- | An interval. The @iEnd@ position is not included in the interval.
 --
 -- Note the invariant which intervals have to satisfy: 'intervalInvariant'.
 data Interval' a = Interval { iStart, iEnd :: !(Position' a) }
-  deriving (Data, Eq, Ord, Functor, Foldable, Traversable, Generic)
+  deriving (Show, Eq, Ord, Functor, Foldable, Traversable, Generic)
 
 type Interval            = Interval' SrcFile
 type IntervalWithoutFile = Interval' ()
+
+instance NFData Interval where
+  rnf = (`seq` ())
+
+instance NFData IntervalWithoutFile where
+  rnf = (`seq` ())
 
 intervalInvariant :: Ord a => Interval' a -> Bool
 intervalInvariant i =
@@ -197,15 +245,28 @@ data Range' a
   = NoRange
   | Range !a (Seq IntervalWithoutFile)
   deriving
-    (Data, Eq, Ord, Functor, Foldable, Traversable, Generic)
+    (Show, Eq, Ord, Functor, Foldable, Traversable, Generic)
 
 type Range = Range' SrcFile
+
+instance NFData a => NFData (Range' a)
 
 instance Null (Range' a) where
   null NoRange = True
   null Range{} = False
 
   empty = NoRange
+
+instance Eq a => Semigroup (Range' a) where
+  NoRange <> r = r
+  r <> NoRange = r
+  Range f is <> Range f' is'
+    | f /= f'   = __IMPOSSIBLE__
+    | otherwise = Range f (is <> is')
+
+instance Eq a => Monoid (Range' a) where
+  mempty  = empty
+  mappend = (<>)
 
 -- | The intervals that make up the range. The intervals are
 -- consecutive and separated ('consecutiveAndSeparated').
@@ -247,6 +308,20 @@ rangeFile :: Range -> SrcFile
 rangeFile NoRange     = Strict.Nothing
 rangeFile (Range f _) = f
 
+-- | The range's top-level module name, if any.
+--
+-- If there is no range, then 'Nothing' is returned. If there is a
+-- range without a module name, then @'Just' 'Nothing'@ is returned.
+rangeModule' :: Range -> Maybe (Maybe TopLevelModuleName)
+rangeModule' NoRange     = Nothing
+rangeModule' (Range f _) = Just $ case f of
+  Strict.Nothing -> Nothing
+  Strict.Just f  -> rangeFileName f
+
+-- | The range's top-level module name, if any.
+rangeModule :: Range -> Maybe TopLevelModuleName
+rangeModule = join . rangeModule'
+
 -- | Conflate a range to its right margin.
 rightMargin :: Range -> Range
 rightMargin r@NoRange      = r
@@ -259,8 +334,11 @@ newtype PrintRange a = PrintRange a
   deriving (Eq, Ord, HasRange, SetRange, KillRange)
 
 -- | Things that have a range are instances of this class.
-class HasRange t where
-    getRange :: t -> Range
+class HasRange a where
+  getRange :: a -> Range
+
+  default getRange :: (Foldable t, HasRange b, t b ~ a) => a -> Range
+  getRange = Fold.foldr fuseRange noRange
 
 instance HasRange Interval where
     getRange i =
@@ -270,18 +348,21 @@ instance HasRange Interval where
 instance HasRange Range where
     getRange = id
 
+instance HasRange () where
+  getRange _ = noRange
+
 instance HasRange Bool where
     getRange _ = noRange
 
 -- | Precondition: The ranges of the list elements must point to the
 -- same file (or be empty).
-instance HasRange a => HasRange [a] where
-    getRange = foldr fuseRange noRange
+instance HasRange a => HasRange [a]
 
 -- | Precondition: The ranges of the list elements must point to the
 -- same file (or be empty).
-instance HasRange a => HasRange (NonemptyList a) where
-    getRange = Fold.foldr fuseRange noRange
+instance HasRange a => HasRange (List1 a)
+instance HasRange a => HasRange (List2 a)
+instance HasRange a => HasRange (Maybe a)
 
 -- | Precondition: The ranges of the tuple elements must point to the
 -- same file (or be empty).
@@ -313,28 +394,30 @@ instance (HasRange a, HasRange b, HasRange c, HasRange d, HasRange e, HasRange f
 instance (HasRange a, HasRange b, HasRange c, HasRange d, HasRange e, HasRange f, HasRange g) => HasRange (a,b,c,d,e,f,g) where
     getRange (x,y,z,w,v,u,t) = getRange (x,(y,(z,(w,(v,(u,t))))))
 
-instance HasRange a => HasRange (Maybe a) where
-    getRange Nothing  = noRange
-    getRange (Just a) = getRange a
-
 instance (HasRange a, HasRange b) => HasRange (Either a b) where
     getRange = either getRange getRange
 
 -- | If it is also possible to set the range, this is the class.
 --
 --   Instances should satisfy @'getRange' ('setRange' r x) == r@.
-class HasRange t => SetRange t where
-  setRange :: Range -> t -> t
+class HasRange a => SetRange a where
+  setRange :: Range -> a -> a
+
+  default setRange :: (Functor f, SetRange b, f b ~ a) => Range -> a -> a
+  setRange = fmap . setRange
 
 instance SetRange Range where
   setRange = const
 
-instance SetRange a => SetRange [a] where
-  setRange r = fmap $ setRange r
+instance SetRange a => SetRange [a]
+instance SetRange a => SetRange (Maybe a)
 
 -- | Killing the range of an object sets all range information to 'noRange'.
 class KillRange a where
   killRange :: KillRangeT a
+
+  default killRange :: (Functor f, KillRange b, f b ~ a) => KillRangeT a
+  killRange = fmap killRange
 
 type KillRangeT a = a -> a
 
@@ -483,18 +566,21 @@ instance KillRange Int where
 instance KillRange Integer where
   killRange = id
 
-instance {-# OVERLAPPABLE #-} KillRange a => KillRange [a] where
-  killRange = map killRange
-
-instance KillRange a => KillRange (NonemptyList a) where
-  killRange = fmap killRange
+instance KillRange Permutation where
+  killRange = id
 
 -- | Overlaps with @KillRange [a]@.
 instance {-# OVERLAPPING #-} KillRange String where
   killRange = id
 
-instance {-# OVERLAPPABLE #-} KillRange a => KillRange (Map k a) where
-  killRange = fmap killRange
+instance {-# OVERLAPPABLE #-} KillRange a => KillRange [a]
+instance {-# OVERLAPPABLE #-} KillRange a => KillRange (Map k a)
+
+instance KillRange a => KillRange (Drop a)
+instance KillRange a => KillRange (List1 a)
+instance KillRange a => KillRange (List2 a)
+instance KillRange a => KillRange (Maybe a)
+instance KillRange a => KillRange (Strict.Maybe a)
 
 instance {-# OVERLAPPABLE #-} (Ord a, KillRange a) => KillRange (Set a) where
   killRange = Set.map killRange
@@ -510,76 +596,27 @@ instance (KillRange a, KillRange b, KillRange c, KillRange d) =>
          KillRange (a, b, c, d) where
   killRange (x, y, z, u) = killRange4 (,,,) x y z u
 
-instance KillRange a => KillRange (Maybe a) where
-  killRange = fmap killRange
-
 instance (KillRange a, KillRange b) => KillRange (Either a b) where
   killRange (Left  x) = Left  $ killRange x
   killRange (Right x) = Right $ killRange x
 
 ------------------------------------------------------------------------
--- Showing
-------------------------------------------------------------------------
-
--- TODO: 'Show' should output Haskell-parseable representations.
--- The following instances are deprecated, and Pretty should be used
--- instead.  Later, simply derive Show for these types.
-
--- ASR (02 December 2014). This instance is not used anymore (module
--- the test suite) when reporting errors. See Issue 1293.
-instance Show a => Show (Position' (Strict.Maybe a)) where
-  show (Pn (Strict.Just f) _ l c) = show f ++ ":" ++
-                                    show l ++ "," ++ show c
-  show (Pn Strict.Nothing  _ l c) = show l ++ "," ++ show c
-
-instance Show PositionWithoutFile where
-  show p = show (p { srcFile = Strict.Nothing } :: Position)
-
-instance Show IntervalWithoutFile where
-  show (Interval s e) = start ++ "-" ++ end
-    where
-      sl = posLine s
-      el = posLine e
-      sc = posCol s
-      ec = posCol e
-
-      start :: String
-      start = show sl ++ "," ++ show sc
-
-      end :: String
-      end | sl == el  = show ec
-          | otherwise = show el ++ "," ++ show ec
-
-instance Show a => Show (Interval' (Strict.Maybe a)) where
-  show i@(Interval s _) = file ++ show (setIntervalFile () i)
-    where
-      file :: String
-      file = case srcFile s of
-               Strict.Nothing -> ""
-               Strict.Just f  -> show f ++ ":"
-
-instance Show a => Show (Range' (Strict.Maybe a)) where
-  show r = case rangeToIntervalWithFile r of
-    Nothing -> ""
-    Just i  -> show i
-
-instance Show a => Show (Range' (Maybe a)) where
-  show = show . fmap Strict.toStrict
-
-------------------------------------------------------------------------
 -- Printing
 ------------------------------------------------------------------------
 
+instance Pretty RangeFile where
+  pretty = pretty . rangeFilePath
+
 instance Pretty a => Pretty (Position' (Strict.Maybe a)) where
-  pretty (Pn Strict.Nothing  _ l c) = pretty l <> pretty "," <> pretty c
+  pretty (Pn Strict.Nothing  _ l c) = pretty l <> "," <> pretty c
   pretty (Pn (Strict.Just f) _ l c) =
-    pretty f <> pretty ":" <> pretty l <> pretty "," <> pretty c
+    pretty f <> ":" <> pretty l <> "," <> pretty c
 
 instance Pretty PositionWithoutFile where
   pretty p = pretty (p { srcFile = Strict.Nothing } :: Position)
 
 instance Pretty IntervalWithoutFile where
-  pretty (Interval s e) = start <> pretty "-" <> end
+  pretty (Interval s e) = start <> "-" <> end
     where
       sl = posLine s
       el = posLine e
@@ -602,12 +639,10 @@ instance Pretty a => Pretty (Interval' (Strict.Maybe a)) where
                Strict.Just f  -> pretty f <> colon
 
 instance Pretty a => Pretty (Range' (Strict.Maybe a)) where
-  pretty r = case rangeToIntervalWithFile r of
-    Nothing -> empty
-    Just i  -> pretty i
+  pretty r = maybe empty pretty (rangeToIntervalWithFile r)
 
 instance (Pretty a, HasRange a) => Pretty (PrintRange a) where
-  pretty (PrintRange a) = pretty a <+> parens (text "at" <+> pretty (getRange a))
+  pretty (PrintRange a) = pretty a <+> parens ("at" <+> pretty (getRange a))
 
 {--------------------------------------------------------------------------
     Functions on positions and ranges
@@ -623,7 +658,7 @@ startPos' f = Pn
   }
 
 -- | The first position in a file: position 1, line 1, column 1.
-startPos :: Maybe AbsolutePath -> Position
+startPos :: Maybe RangeFile -> Position
 startPos = startPos' . Strict.toStrict
 
 -- | Ranges between two unknown positions
@@ -641,31 +676,14 @@ movePos (Pn f p l c) _    = Pn f (p + 1) l (c + 1)
 -- | Advance the position by a string.
 --
 --   > movePosByString = foldl' movePos
-movePosByString :: Position' a -> String -> Position' a
-movePosByString = foldl' movePos
+movePosByString :: Foldable t => Position' a -> t Char -> Position' a
+movePosByString = Fold.foldl' movePos
 
 -- | Backup the position by one character.
 --
 -- Precondition: The character must not be @'\n'@.
 backupPos :: Position' a -> Position' a
 backupPos (Pn f p l c) = Pn f (p - 1) l (c - 1)
-
--- | Extracts the interval corresponding to the given string, assuming
--- that the string starts at the beginning of the given interval.
---
--- Precondition: The string must not be too long for the interval.
-takeI :: String -> Interval' a -> Interval' a
-takeI s i | genericLength s > iLength i = __IMPOSSIBLE__
-          | otherwise = i { iEnd = movePosByString (iStart i) s }
-
--- | Removes the interval corresponding to the given string from the
--- given interval, assuming that the string starts at the beginning of
--- the interval.
---
--- Precondition: The string must not be too long for the interval.
-dropI :: String -> Interval' a -> Interval' a
-dropI s i | genericLength s > iLength i = __IMPOSSIBLE__
-          | otherwise = i { iStart = movePosByString (iStart i) s }
 
 -- | Converts a file name and two positions to a range.
 posToRange' ::
@@ -747,10 +765,10 @@ rEnd r@(Range f _) = (\p -> p { srcFile = f }) <$> rEnd' r
 --
 -- Precondition: The intervals must point to the same file.
 fuseIntervals :: Ord a => Interval' a -> Interval' a -> Interval' a
-fuseIntervals x y = Interval { iStart = head ss, iEnd = last es }
+fuseIntervals x y = Interval { iStart = s, iEnd = e }
     where
-    ss = sort [iStart x, iStart y]
-    es = sort [iEnd   x, iEnd   y]
+    s = headWithDefault __IMPOSSIBLE__ $ sort [iStart x, iStart y]
+    e = lastWithDefault __IMPOSSIBLE__ $ sort [iEnd   x, iEnd   y]
 
 -- | @fuseRanges r r'@ unions the ranges @r@ and @r'@.
 --
@@ -852,4 +870,3 @@ interleaveRanges as bs = runWriter$ go as bs
           (a:) <$> go as' bs
         else
           (b:) <$> go as bs'
-

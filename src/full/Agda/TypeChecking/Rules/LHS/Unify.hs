@@ -1,8 +1,4 @@
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE NondecreasingIndentation   #-}
-{-# LANGUAGE UndecidableInstances       #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 
 -- | Unification algorithm for specializing datatype indices, as described in
 --     \"Unifiers as Equivalences: Proof-Relevant Unification of Dependently
@@ -15,62 +11,81 @@
 --   splitting (see @Agda.Interaction.MakeCase@).
 --
 --   A unification problem (of type @UnifyState@) consists of:
+--
 --   1. A telescope @varTel@ of free variables, some or all of which are
 --      flexible (as indicated by @flexVars@).
+--
 --   2. A telescope @eqTel@ containing the types of the equations.
+--
 --   3. Left- and right-hand sides for each equation:
 --      @varTel ⊢ eqLHS : eqTel@ and @varTel ⊢ eqRHS : eqTel@.
 --
 --   The unification algorithm can end in three different ways:
 --   (type @UnificationResult@):
+--
 --   - A *positive success* @Unifies (tel, sigma, ps)@ with @tel ⊢ sigma : varTel@,
 --     @tel ⊢ eqLHS [ varTel ↦ sigma ] ≡ eqRHS [ varTel ↦ sigma ] : eqTel@,
 --     and @tel ⊢ ps : eqTel@. In this case, @sigma;ps@ is an *equivalence*
 --     between the telescopes @tel@ and @varTel(eqLHS ≡ eqRHS)@.
+--
 --   - A *negative success* @NoUnify err@ means that a conflicting equation
 --     was found (e.g an equation between two distinct constructors or a cycle).
---   - A *failure* @DontKnow err@ means that the unifier got stuck.
+--
+--   - A *failure* @UnifyStuck err@ means that the unifier got stuck.
 --
 --   The unification algorithm itself consists of two parts:
+--
 --   1. A *unification strategy* takes a unification problem and produces a
 --      list of suggested unification rules (of type @UnifyStep@). Strategies
 --      can be constructed by composing simpler strategies (see for example the
 --      definition of @completeStrategyAt@).
+--
 --   2. The *unification engine* @unifyStep@ takes a unification rule and tries
 --      to apply it to the given state, writing the result to the UnifyOutput
 --      on a success.
 --
 --   The unification steps (of type @UnifyStep@) are the following:
+--
 --   - *Deletion* removes a reflexive equation @u =?= v : a@ if the left- and
 --     right-hand side @u@ and @v@ are (definitionally) equal. This rule results
 --     in a failure if --without-K is enabled (see \"Pattern Matching Without K\"
 --     by Jesper Cockx, Dominique Devriese, and Frank Piessens (ICFP 2014).
+--
 --   - *Solution* solves an equation if one side is (eta-equivalent to) a
 --     flexible variable. In case both sides are flexible variables, the
 --     unification strategy makes a choice according to the @chooseFlex@
 --     function in @Agda.TypeChecking.Rules.LHS.Problem@.
+--
 --   - *Injectivity* decomposes an equation of the form
 --     @c us =?= c vs : D pars is@ where @c : Δc → D pars js@ is a constructor
 --     of the inductive datatype @D@ into a sequence of equations
 --     @us =?= vs : delta@. In case @D@ is an indexed datatype,
 --     *higher-dimensional unification* is applied (see below).
+--
 --   - *Conflict* detects absurd equations of the form
 --     @c₁ us =?= c₂ vs : D pars is@ where @c₁@ and @c₂@ are two distinct
 --     constructors of the datatype @D@.
+--
 --   - *Cycle* detects absurd equations of the form @x =?= v : D pars is@ where
 --     @x@ is a variable of the datatype @D@ that occurs strongly rigid in @v@.
+--
 --   - *EtaExpandVar* eta-expands a single flexible variable @x : R@ where @R@
 --     is a (eta-expandable) record type, replacing it by one variable for each
 --     field of @R@.
+--
 --   - *EtaExpandEquation* eta-expands an equation @u =?= v : R@ where @R@ is a
 --     (eta-expandable) record type, replacing it by one equation for each field
 --     of @R@. The left- and right-hand sides of these equations are the
 --     projections of @u@ and @v@.
+--
 --   - *LitConflict* detects absurd equations of the form @l₁ =?= l₂ : A@ where
 --     @l₁@ and @l₂@ are distinct literal terms.
+--
 --   - *StripSizeSuc* simplifies an equation of the form
 --     @sizeSuc x =?= sizeSuc y : Size@ to @x =?= y : Size@.
+--
 --   - *SkipIrrelevantEquation@ removes an equation between irrelevant terms.
+--
 --   - *TypeConInjectivity* decomposes an equation of the form
 --     @D us =?= D vs : Set i@ where @D@ is a datatype. This rule is only used
 --     if --injective-type-constructors is enabled.
@@ -103,72 +118,78 @@
 module Agda.TypeChecking.Rules.LHS.Unify
   ( UnificationResult
   , UnificationResult'(..)
+  , NoLeftInv(..)
+  , unifyIndices'
   , unifyIndices ) where
 
 import Prelude hiding (null)
 
-import Control.Arrow ((***))
-import Control.Applicative hiding (empty)
 import Control.Monad
 import Control.Monad.State
-import Control.Monad.Trans.Maybe
-import Control.Monad.Reader
-import Control.Monad.Writer (WriterT(..), MonadWriter(..), Monoid(..))
+import Control.Monad.Writer (WriterT(..), MonadWriter(..))
+import Control.Monad.Except
 
-import Data.Map (Map)
-import qualified Data.Map as Map
 import Data.Semigroup hiding (Arg)
 import qualified Data.List as List
+import qualified Data.IntSet as IntSet
+import qualified Data.IntMap as IntMap
+import Data.IntMap (IntMap)
 
-import Data.Foldable (Foldable)
-import Data.Traversable (Traversable,traverse)
-import qualified Data.Traversable as Trav
+import qualified Agda.Benchmarking as Bench
 
-import Agda.Interaction.Options (optInjectiveTypeConstructors)
+import Agda.Interaction.Options (optInjectiveTypeConstructors, optCubical, optWithoutK)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
-import Agda.Syntax.Internal.Pattern
 import Agda.Syntax.Literal
-import Agda.Syntax.Position
 
 import Agda.TypeChecking.Monad
 import qualified Agda.TypeChecking.Monad.Benchmark as Bench
-import Agda.TypeChecking.Monad.Builtin (constructorForm)
+import Agda.TypeChecking.Monad.Builtin -- (constructorForm, getTerm, builtinPathP)
+import Agda.TypeChecking.Primitive hiding (Nat)
+import Agda.TypeChecking.Primitive.Cubical
+import Agda.TypeChecking.Names
 import Agda.TypeChecking.Conversion -- equalTerm
+import Agda.TypeChecking.Conversion.Pure
 import Agda.TypeChecking.Constraints
 import Agda.TypeChecking.Datatypes
-import Agda.TypeChecking.DropArgs
 import Agda.TypeChecking.Irrelevance
 import Agda.TypeChecking.Level (reallyUnLevelView)
 import Agda.TypeChecking.Reduce
 import qualified Agda.TypeChecking.Patterns.Match as Match
-import Agda.TypeChecking.Pretty hiding ((<>))
-import Agda.TypeChecking.SizedTypes (compareSizes)
+import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Free
+import Agda.TypeChecking.Free.Precompute
+import Agda.TypeChecking.Free.Reduce
 import Agda.TypeChecking.Records
-import Agda.TypeChecking.MetaVars (assignV, newArgsMetaCtx)
-import Agda.TypeChecking.EtaContract
-import Agda.Interaction.Options (optInjectiveTypeConstructors, optWithoutK)
 
 import Agda.TypeChecking.Rules.LHS.Problem
--- import Agda.TypeChecking.SyntacticEquality
+import Agda.TypeChecking.Rules.LHS.Unify.Types
+import Agda.TypeChecking.Rules.LHS.Unify.LeftInverse
 
-import Agda.Utils.Except ( MonadError(catchError, throwError) )
+import Agda.Utils.Empty
 import Agda.Utils.Either
+import Agda.Utils.Benchmark
+import Agda.Utils.Either
+import Agda.Utils.Function
 import Agda.Utils.Functor
+import Agda.Utils.Lens
 import Agda.Utils.List
 import Agda.Utils.ListT
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
+import Agda.Utils.PartialOrd
 import Agda.Utils.Permutation
+import Agda.Utils.Singleton
 import Agda.Utils.Size
+import Agda.Utils.WithDefault
+import Agda.Utils.Tuple
 
-#include "undefined.h"
 import Agda.Utils.Impossible
+
 
 -- | Result of 'unifyIndices'.
 type UnificationResult = UnificationResult'
@@ -177,396 +198,93 @@ type UnificationResult = UnificationResult'
   , [NamedArg DeBruijnPattern] -- @ps@    s.t. @tel ⊢ ps    : eqTel @
   )
 
+type FullUnificationResult = UnificationResult'
+  ( Telescope                  -- @tel@
+  , PatternSubstitution        -- @sigma@ s.t. @tel ⊢ sigma : varTel@
+  , [NamedArg DeBruijnPattern] -- @ps@    s.t. @tel ⊢ ps    : eqTel @
+  , Either NoLeftInv (Substitution, Substitution) -- (τ,leftInv)
+  )
+
 data UnificationResult' a
-  = Unifies  a                    -- ^ Unification succeeded.
-  | NoUnify  NegativeUnification  -- ^ Terms are not unifiable.
-  | DontKnow [UnificationFailure] -- ^ Some other error happened, unification got stuck.
+  = Unifies  a                        -- ^ Unification succeeded.
+  | NoUnify  NegativeUnification      -- ^ Terms are not unifiable.
+  | UnifyBlocked Blocker              -- ^ Unification got blocked on a metavariable
+  | UnifyStuck   [UnificationFailure] -- ^ Some other error happened, unification got stuck.
   deriving (Show, Functor, Foldable, Traversable)
 
 -- | Unify indices.
 --
---   In @unifyIndices gamma flex us vs@,
+--   In @unifyIndices gamma flex a us vs@,
 --
---   @us@ and @vs@ are the argument lists to unify,
+--   * @us@ and @vs@ are the argument lists to unify, eliminating type @a@.
 --
---   @gamma@ is the telescope of free variables in @us@ and @vs@.
+--   * @gamma@ is the telescope of free variables in @us@ and @vs@.
 --
---   @flex@ is the set of flexible (instantiable) variabes in @us@ and @vs@.
+--   * @flex@ is the set of flexible (instantiable) variabes in @us@ and @vs@.
 --
 --   The result is the most general unifier of @us@ and @vs@.
-unifyIndices :: MonadTCM tcm
-             => Telescope
-             -> FlexibleVars
-             -> Type
-             -> Args
-             -> Args
-             -> tcm UnificationResult
-unifyIndices tel flex a [] [] = return $ Unifies (tel, idS, [])
-unifyIndices tel flex a us vs = liftTCM $ Bench.billTo [Bench.Typing, Bench.CheckLHS, Bench.UnifyIndices] $ do
+unifyIndices
+  :: (PureTCM m, MonadBench m, BenchPhase m ~ Bench.Phase, MonadError TCErr m)
+  => Maybe NoLeftInv -- ^ Do we have a reason for not computing a left inverse?
+  -> Telescope       -- ^ @gamma@
+  -> FlexibleVars    -- ^ @flex@
+  -> Type            -- ^ @a@
+  -> Args            -- ^ @us@
+  -> Args            -- ^ @vs@
+  -> m UnificationResult
+unifyIndices linv tel flex a us vs =
+  Bench.billTo [Bench.Typing, Bench.CheckLHS, Bench.UnifyIndices] $
+    fmap (\(a,b,c,_) -> (a,b,c)) <$> unifyIndices' linv tel flex a us vs
+
+unifyIndices'
+  :: (PureTCM m, MonadError TCErr m)
+  => Maybe NoLeftInv -- ^ Do we have a reason for not computing a left inverse?
+  -> Telescope     -- ^ @gamma@
+  -> FlexibleVars  -- ^ @flex@
+  -> Type          -- ^ @a@
+  -> Args          -- ^ @us@
+  -> Args          -- ^ @vs@
+  -> m FullUnificationResult
+unifyIndices' linv tel flex a [] [] = return $ Unifies (tel, idS, [], Right (idS, raiseS 1))
+unifyIndices' linv tel flex a us vs = do
     reportSDoc "tc.lhs.unify" 10 $
-      sep [ text "unifyIndices"
-          , nest 2 $ prettyTCM tel
-          , nest 2 $ addContext tel $ text $ show $ map flexVar flex
-          , nest 2 $ addContext tel $ parens (prettyTCM a)
-          , nest 2 $ addContext tel $ prettyList $ map prettyTCM us
-          , nest 2 $ addContext tel $ prettyList $ map prettyTCM vs
+      sep [ "unifyIndices"
+          , ("tel  =" <+>) $ nest 2 $ prettyTCM tel
+          , ("flex =" <+>) $ nest 2 $ addContext tel $ text $ show $ map flexVar flex
+          , ("a    =" <+>) $ nest 2 $ addContext tel $ parens (prettyTCM a)
+          , ("us   =" <+>) $ nest 2 $ addContext tel $ prettyList $ map prettyTCM us
+          , ("vs   =" <+>) $ nest 2 $ addContext tel $ prettyList $ map prettyTCM vs
           ]
     initialState    <- initUnifyState tel flex a us vs
-    reportSDoc "tc.lhs.unify" 20 $ text "initial unifyState:" <+> prettyTCM initialState
-    reportSDoc "tc.lhs.unify" 70 $ text "initial unifyState:" <+> text (show initialState)
-    (result,output) <- runUnifyM $ unify initialState rightToLeftStrategy
-    let ps = applySubst (unifyProof output) $ teleNamedArgs (eqTel initialState)
-    return $ fmap (\s -> (varTel s , unifySubst output , ps)) result
-
-----------------------------------------------------
--- Equalities
-----------------------------------------------------
-
-data Equality = Equal
-  { eqType  :: Dom Type
-  , eqLeft  :: Term
-  , eqRight :: Term
-  }
-
-instance Reduce Equality where
-  reduce' (Equal a u v) = Equal <$> reduce' a <*> reduce' u <*> reduce' v
-
-eqConstructorForm :: Equality -> TCM Equality
-eqConstructorForm (Equal a u v) = Equal a <$> constructorForm u <*> constructorForm v
-
-eqUnLevel :: Equality -> TCM Equality
-eqUnLevel (Equal a u v) = Equal a <$> unLevel u <*> unLevel v
-  where
-    unLevel (Level l) = reallyUnLevelView l
-    unLevel u         = return u
-
-----------------------------------------------------
--- Unify state
-----------------------------------------------------
-
-data UnifyState = UState
-  { varTel   :: Telescope
-  , flexVars :: FlexibleVars
-  , eqTel    :: Telescope
-  , eqLHS    :: [Arg Term]
-  , eqRHS    :: [Arg Term]
-  } deriving (Show)
-
-instance Reduce UnifyState where
-  reduce' (UState var flex eq lhs rhs) =
-    UState <$> reduce' var
-           <*> pure flex
-           <*> reduce' eq
-           <*> reduce' lhs
-           <*> reduce' rhs
-
-reduceVarTel :: UnifyState -> TCM UnifyState
-reduceVarTel s@UState{ varTel = tel } = do
-  tel <- reduce tel
-  return $ s { varTel = tel }
-
-reduceEqTel :: UnifyState -> TCM UnifyState
-reduceEqTel s@UState{ eqTel = tel } = do
-  tel <- reduce tel
-  return $ s { eqTel = tel }
-
-instance Normalise UnifyState where
-  normalise' (UState var flex eq lhs rhs) =
-    UState <$> normalise' var
-           <*> pure flex
-           <*> normalise' eq
-           <*> normalise' lhs
-           <*> normalise' rhs
-
-normaliseVarTel :: UnifyState -> TCM UnifyState
-normaliseVarTel s@UState{ varTel = tel } = do
-  tel <- normalise tel
-  return $ s { varTel = tel }
-
-normaliseEqTel :: UnifyState -> TCM UnifyState
-normaliseEqTel s@UState{ eqTel = tel } = do
-  tel <- normalise tel
-  return $ s { eqTel = tel }
-
-instance PrettyTCM UnifyState where
-  prettyTCM state = text "UnifyState" $$ nest 2 (vcat $
-    [ text "variable tel:  " <+> prettyTCM gamma
-    , text "flexible vars: " <+> prettyTCM (map flexVar $ flexVars state)
-    , text "equation tel:  " <+> addContext gamma (prettyTCM delta)
-    , text "equations:     " <+> addContext gamma (prettyList_ (zipWith prettyEquality (eqLHS state) (eqRHS state)))
-    ])
-    where
-      gamma = varTel state
-      delta = eqTel state
-      prettyEquality x y = prettyTCM x <+> text "=?=" <+> prettyTCM y
-
-initUnifyState :: Telescope -> FlexibleVars -> Type -> Args -> Args -> TCM UnifyState
-initUnifyState tel flex a lhs rhs = do
-  let n = size lhs
-  unless (n == size rhs) __IMPOSSIBLE__
-  TelV eqTel _ <- telView a
-  unless (n == size eqTel) __IMPOSSIBLE__
-  reduce $ UState tel flex eqTel lhs rhs
-
-isUnifyStateSolved :: UnifyState -> Bool
-isUnifyStateSolved = null . eqTel
-
-varCount :: UnifyState -> Int
-varCount = size . varTel
-
--- | Get the type of the i'th variable in the given state
-getVarType :: Int -> UnifyState -> Dom Type
-getVarType i s = if i < 0 then __IMPOSSIBLE__ else (flattenTel $ varTel s) !! i
-
-getVarTypeUnraised :: Int -> UnifyState -> Dom Type
-getVarTypeUnraised i s = if i < 0 then __IMPOSSIBLE__ else snd <$> (telToList $ varTel s) !! i
-
-eqCount :: UnifyState -> Int
-eqCount = size . eqTel
-
--- | Get the k'th equality in the given state. The left- and right-hand sides
---   of the equality live in the varTel telescope, and the type of the equality
---   lives in the varTel++eqTel telescope
-getEquality :: Int -> UnifyState -> Equality
-getEquality k UState { eqTel = eqs, eqLHS = lhs, eqRHS = rhs } =
-  if k < 0 then __IMPOSSIBLE__ else
-    Equal (flattenTel eqs !! k) (unArg $ lhs !! k) (unArg $ rhs !! k)
-
--- | As getEquality, but with the unraised type
-getEqualityUnraised :: Int -> UnifyState -> Equality
-getEqualityUnraised k UState { eqTel = eqs, eqLHS = lhs, eqRHS = rhs } =
-  if k < 0 then __IMPOSSIBLE__ else
-    Equal (snd <$> (telToList eqs) !! k)
-          (unArg $ lhs !! k)
-          (unArg $ rhs !! k)
-
-getEqInfo :: Int -> UnifyState -> ArgInfo
-getEqInfo k UState { eqTel = eqs } =
-  if k < 0 then __IMPOSSIBLE__ else domInfo $ telToList eqs !! k
-
--- | Add a list of equations to the front of the equation telescope
-addEqs :: Telescope -> [Arg Term] -> [Arg Term] -> UnifyState -> UnifyState
-addEqs tel us vs s =
-  s { eqTel = tel `abstract` eqTel s
-    , eqLHS = us ++ eqLHS s
-    , eqRHS = vs ++ eqRHS s
-    }
-  where k = size tel
-
-addEq :: Type -> Arg Term -> Arg Term -> UnifyState -> UnifyState
-addEq a u v = addEqs (ExtendTel (defaultDom a) (Abs underscore EmptyTel)) [u] [v]
+    reportSDoc "tc.lhs.unify" 20 $ "initial unifyState:" <+> prettyTCM initialState
+    (result,log) <- runUnifyLogT $ unify initialState rightToLeftStrategy
+    forM result $ \ s -> do -- Unifies case
+        let output = mconcat [output | (UnificationStep _ _ output,_) <- log ]
+        let ps = applySubst (unifyProof output) $ teleNamedArgs (eqTel initialState)
+        tauInv <- do
+          strict     <- asksTC envSplitOnStrict
+          cubicalCompatible <- cubicalCompatibleOption
+          withoutK <- withoutKOption
+          case linv of
+            Just reason -> pure (Left reason)
+            Nothing
+              | strict            -> pure (Left SplitOnStrict)
+              | cubicalCompatible -> buildLeftInverse initialState log
+              | withoutK          -> pure (Left NoCubical)
+              | otherwise         -> pure (Left WithKEnabled)
+        reportSDoc "tc.lhs.unify" 20 $ "ps:" <+> pretty ps
+        return $ (varTel s, unifySubst output, ps, tauInv)
 
 
 
--- | Instantiate the k'th variable with the given value.
---   Returns Nothing if there is a cycle.
-solveVar :: Int    -- ^ Index @k@
-         -> Term   -- ^ Solution @u@
-         -> UnifyState -> Maybe (UnifyState, PatternSubstitution)
-solveVar k u s = case instantiateTelescope (varTel s) k u of
-  Nothing -> Nothing
-  Just (tel' , sigma , rho) -> Just $ (,sigma) $ UState
-      { varTel   = tel'
-      , flexVars = permuteFlex (reverseP rho) $ flexVars s
-      , eqTel    = applyPatSubst sigma $ eqTel s
-      , eqLHS    = applyPatSubst sigma $ eqLHS s
-      , eqRHS    = applyPatSubst sigma $ eqRHS s
-      }
-  where
-    permuteFlex :: Permutation -> FlexibleVars -> FlexibleVars
-    permuteFlex perm =
-      mapMaybe $ \(FlexibleVar h o k p x) ->
-        FlexibleVar h o k p <$> List.findIndex (x==) (permPicks perm)
+type UnifyStrategy = forall m. (PureTCM m, MonadPlus m) => UnifyState -> m UnifyStep
 
-applyUnder :: Int -> Telescope -> Term -> Telescope
-applyUnder k tel u
- | k < 0     = __IMPOSSIBLE__
- | k == 0    = tel `apply1` u
- | otherwise = case tel of
-    EmptyTel         -> __IMPOSSIBLE__
-    ExtendTel a tel' -> ExtendTel a $
-      Abs (absName tel') $ applyUnder (k-1) (absBody tel') u
 
-dropAt :: Int -> [a] -> [a]
-dropAt _ [] = __IMPOSSIBLE__
-dropAt k (x:xs)
- | k < 0     = __IMPOSSIBLE__
- | k == 0    = xs
- | otherwise = x : dropAt (k-1) xs
-
--- | Solve the k'th equation with the given value, which can depend on
---   regular variables but not on other equation variables.
-solveEq :: Int -> Term -> UnifyState -> (UnifyState, PatternSubstitution)
-solveEq k u s = (,sigma) $ s
-    { eqTel    = applyUnder k (eqTel s) u'
-    , eqLHS    = dropAt k $ eqLHS s
-    , eqRHS    = dropAt k $ eqRHS s
-    }
-  where
-    u'    = raise k u
-    n     = eqCount s
-    sigma = liftS (n-k-1) $ consS (dotP u') idS
-
--- | Simplify the k'th equation with the given value (which can depend on other
---   equation variables). Returns Nothing if there is a cycle.
-simplifyEq :: Int -> Term -> UnifyState -> Maybe (UnifyState, PatternSubstitution)
-simplifyEq k u s = case instantiateTelescope (eqTel s) k u of
-  Nothing -> Nothing
-  Just (tel' , sigma , rho) -> Just $ (,sigma) $ UState
-    { varTel   = varTel s
-    , flexVars = flexVars s
-    , eqTel    = tel'
-    , eqLHS    = permute rho $ eqLHS s
-    , eqRHS    = permute rho $ eqRHS s
-    }
-
-----------------------------------------------------
--- Unification strategies
-----------------------------------------------------
-
-data UnifyStep
-  = Deletion
-    { deleteAt           :: Int
-    , deleteType         :: Type
-    , deleteLeft         :: Term
-    , deleteRight        :: Term
-    }
-  | Solution
-    { solutionAt         :: Int
-    , solutionType       :: Dom Type
-    , solutionVar        :: FlexibleVar Int
-    , solutionTerm       :: Term
-    }
-  | Injectivity
-    { injectAt           :: Int
-    , injectType         :: Type
-    , injectDatatype     :: QName
-    , injectParameters   :: Args
-    , injectIndices      :: Args
-    , injectConstructor  :: ConHead
-    }
-  | Conflict
-    { conflictAt         :: Int
-    , conflictType       :: Type
-    , conflictDatatype   :: QName
-    , conflictParameters :: Args
-    , conflictLeft       :: Term
-    , conflictRight      :: Term
-    }
-  | Cycle
-    { cycleAt            :: Int
-    , cycleType          :: Type
-    , cycleDatatype      :: QName
-    , cycleParameters    :: Args
-    , cycleVar           :: Int
-    , cycleOccursIn      :: Term
-    }
-  | EtaExpandVar
-    { expandVar           :: FlexibleVar Int
-    , expandVarRecordType :: QName
-    , expandVarParameters :: Args
-    }
-  | EtaExpandEquation
-    { expandAt           :: Int
-    , expandRecordType   :: QName
-    , expandParameters   :: Args
-    }
-  | LitConflict
-    { litConflictAt      :: Int
-    , litType            :: Type
-    , litConflictLeft    :: Literal
-    , litConflictRight   :: Literal
-    }
-  | StripSizeSuc
-    { stripAt            :: Int
-    , stripArgLeft       :: Term
-    , stripArgRight      :: Term
-    }
-  | SkipIrrelevantEquation
-    { skipIrrelevantAt   :: Int
-    }
-  | TypeConInjectivity
-    { typeConInjectAt    :: Int
-    , typeConstructor    :: QName
-    , typeConArgsLeft    :: Args
-    , typeConArgsRight   :: Args
-    } deriving (Show)
-
-instance PrettyTCM UnifyStep where
-  prettyTCM step = case step of
-    Deletion k a u v -> text "Deletion" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "lhs:        " <+> prettyTCM u
-      , text "rhs:        " <+> prettyTCM v
-      ])
-    Solution k a i u -> text "Solution" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "variable:   " <+> text (show i)
-      , text "term:       " <+> prettyTCM u
-      ])
-    Injectivity k a d pars ixs c -> text "Injectivity" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "datatype:   " <+> prettyTCM d
-      , text "parameters: " <+> prettyList_ (map prettyTCM pars)
-      , text "indices:    " <+> prettyList_ (map prettyTCM ixs)
-      , text "constructor:" <+> prettyTCM c
-      ])
-    Conflict k a d pars u v -> text "Conflict" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "datatype:   " <+> prettyTCM d
-      , text "parameters: " <+> prettyList_ (map prettyTCM pars)
-      , text "lhs:        " <+> prettyTCM u
-      , text "rhs:        " <+> prettyTCM v
-      ])
-    Cycle k a d pars i u -> text "Cycle" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "datatype:   " <+> prettyTCM d
-      , text "parameters: " <+> prettyList_ (map prettyTCM pars)
-      , text "variable:   " <+> text (show i)
-      , text "term:       " <+> prettyTCM u
-      ])
-    EtaExpandVar fi r pars -> text "EtaExpandVar" $$ nest 2 (vcat $
-      [ text "variable:   " <+> text (show fi)
-      , text "record type:" <+> prettyTCM r
-      , text "parameters: " <+> prettyTCM pars
-      ])
-    EtaExpandEquation k r pars -> text "EtaExpandEquation" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "record type:" <+> prettyTCM r
-      , text "parameters: " <+> prettyTCM pars
-      ])
-    LitConflict k a u v -> text "LitConflict" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "type:       " <+> prettyTCM a
-      , text "lhs:        " <+> prettyTCM u
-      , text "rhs:        " <+> prettyTCM v
-      ])
-    StripSizeSuc k u v -> text "StripSizeSuc" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "lhs:        " <+> prettyTCM u
-      , text "rhs:        " <+> prettyTCM v
-      ])
-    SkipIrrelevantEquation k -> text "SkipIrrelevantEquation" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      ])
-    TypeConInjectivity k d us vs -> text "TypeConInjectivity" $$ nest 2 (vcat $
-      [ text "position:   " <+> text (show k)
-      , text "datatype:   " <+> prettyTCM d
-      , text "lhs:        " <+> prettyList_ (map prettyTCM us)
-      , text "rhs:        " <+> prettyList_ (map prettyTCM vs)
-      ])
-
-type UnifyStrategy = UnifyState -> ListT TCM UnifyStep
-
-leftToRightStrategy :: UnifyStrategy
-leftToRightStrategy s =
-    msum (for [0..n-1] $ \k -> completeStrategyAt k s)
-  where n = size $ eqTel s
+--UNUSED Liang-Ting Chen 2019-07-16
+--leftToRightStrategy :: UnifyStrategy
+--leftToRightStrategy s =
+--    msum (for [0..n-1] $ \k -> completeStrategyAt k s)
+--  where n = size $ eqTel s
 
 rightToLeftStrategy :: UnifyStrategy
 rightToLeftStrategy s =
@@ -575,36 +293,38 @@ rightToLeftStrategy s =
 
 completeStrategyAt :: Int -> UnifyStrategy
 completeStrategyAt k s = msum $ map (\strat -> strat k s) $
-    [ skipIrrelevantStrategy
-    , basicUnifyStrategy
-    , literalStrategy
-    , dataStrategy
-    , etaExpandVarStrategy
-    , etaExpandEquationStrategy
-    , injectiveTypeConStrategy
-    , injectivePragmaStrategy
-    , simplifySizesStrategy
-    , checkEqualityStrategy
+-- ASR (2021-02-07). The below eta-expansions are required by GHC >=
+-- 9.0.1 (see Issue #4955).
+    [ (\n -> skipIrrelevantStrategy n)
+    , (\n -> basicUnifyStrategy n)
+    , (\n -> literalStrategy n)
+    , (\n -> dataStrategy n)
+    , (\n -> etaExpandVarStrategy  n)
+    , (\n -> etaExpandEquationStrategy n)
+    , (\n -> injectiveTypeConStrategy n)
+    , (\n -> injectivePragmaStrategy n)
+    , (\n -> simplifySizesStrategy n)
+    , (\n -> checkEqualityStrategy n)
     ]
 
--- | Returns true if the variables 0..k-1 don't occur in x
-isHom :: (Free a, Subst Term a) => Int -> a -> Maybe a
+-- | @isHom n x@ returns x lowered by n if the variables 0..n-1 don't occur in x.
+--
+-- This is naturally sensitive to normalization.
+isHom :: (Free a, Subst a) => Int -> a -> Maybe a
 isHom n x = do
   guard $ getAll $ runFree (All . (>= n)) IgnoreNot x
   return $ raise (-n) x
 
 findFlexible :: Int -> FlexibleVars -> Maybe (FlexibleVar Nat)
-findFlexible i flex =
-  let flex'      = map flexVar flex
-      flexible i = i `elem` flex'
-  in List.find ((i ==) . flexVar) flex
+findFlexible i flex = List.find ((i ==) . flexVar) flex
 
 basicUnifyStrategy :: Int -> UnifyStrategy
 basicUnifyStrategy k s = do
-  Equal (Dom info fin a) u v <- liftTCM $ eqUnLevel (getEquality k s)
+  Equal dom@Dom{unDom = a} u v <- eqUnLevel (getEquality k s)
+    -- Andreas, 2019-02-23: reduce equality for the sake of isHom?
   ha <- fromMaybeMP $ isHom n a
-  (mi, mj) <- liftTCM $ addContext (varTel s) $ (,) <$> isEtaVar u ha <*> isEtaVar v ha
-  liftTCM $ reportSDoc "tc.lhs.unify" 30 $ text "isEtaVar results: " <+> text (show [mi,mj])
+  (mi, mj) <- addContext (varTel s) $ (,) <$> isEtaVar u ha <*> isEtaVar v ha
+  reportSDoc "tc.lhs.unify" 30 $ "isEtaVar results: " <+> text (show [mi,mj])
   case (mi, mj) of
     (Just i, Just j)
      | i == j -> mzero -- Taken care of by checkEqualityStrategy
@@ -612,58 +332,62 @@ basicUnifyStrategy k s = do
      | Just fi <- findFlexible i flex
      , Just fj <- findFlexible j flex -> do
        let choice = chooseFlex fi fj
-           firstTryLeft  = msum [ return (Solution k (Dom info fin ha) fi v)
-                                , return (Solution k (Dom info fin ha) fj u)]
-           firstTryRight = msum [ return (Solution k (Dom info fin ha) fj u)
-                                , return (Solution k (Dom info fin ha) fi v)]
-       liftTCM $ reportSDoc "tc.lhs.unify" 40 $ text "fi = " <+> text (show fi)
-       liftTCM $ reportSDoc "tc.lhs.unify" 40 $ text "fj = " <+> text (show fj)
-       liftTCM $ reportSDoc "tc.lhs.unify" 40 $ text "chooseFlex: " <+> text (show choice)
+           firstTryLeft  = msum [ return (Solution k dom{unDom = ha} fi v left)
+                                , return (Solution k dom{unDom = ha} fj u right)]
+           firstTryRight = msum [ return (Solution k dom{unDom = ha} fj u right)
+                                , return (Solution k dom{unDom = ha} fi v left)]
+       reportSDoc "tc.lhs.unify" 40 $ "fi = " <+> text (show fi)
+       reportSDoc "tc.lhs.unify" 40 $ "fj = " <+> text (show fj)
+       reportSDoc "tc.lhs.unify" 40 $ "chooseFlex: " <+> text (show choice)
        case choice of
          ChooseLeft   -> firstTryLeft
          ChooseRight  -> firstTryRight
          ExpandBoth   -> mzero -- This should be taken care of by etaExpandEquationStrategy
          ChooseEither -> firstTryRight
     (Just i, _)
-     | Just fi <- findFlexible i flex -> return $ Solution k (Dom info fin ha) fi v
+     | Just fi <- findFlexible i flex -> return $ Solution k dom{unDom = ha} fi v left
     (_, Just j)
-     | Just fj <- findFlexible j flex -> return $ Solution k (Dom info fin ha) fj u
+     | Just fj <- findFlexible j flex -> return $ Solution k dom{unDom = ha} fj u right
     _ -> mzero
   where
     flex = flexVars s
     n = eqCount s
+    left = Left (); right = Right ()
 
 dataStrategy :: Int -> UnifyStrategy
 dataStrategy k s = do
-  Equal (Dom _ _ a) u v <- liftTCM $ eqConstructorForm =<< eqUnLevel (getEqualityUnraised k s)
+  Equal Dom{unDom = a} u v <- eqConstructorForm =<< eqUnLevel =<< getReducedEqualityUnraised k s
+  sortOk <- reduce (getSort a) <&> \case
+    Type{} -> True
+    Inf{}  -> True
+    SSet{} -> True
+    _      -> False
   case unEl a of
-    Def d es | Type{} <- getSort a -> do
-      npars <- catMaybesMP $ liftTCM $ getNumberOfParameters d
+    Def d es | sortOk -> do
+      npars <- catMaybesMP $ getNumberOfParameters d
       let (pars,ixs) = splitAt npars $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-      hpars <- fromMaybeMP $ isHom k pars
-      liftTCM $ reportSDoc "tc.lhs.unify" 40 $ addContext (varTel s) $
-        text "Found equation at datatype " <+> prettyTCM d
-         <+> text " with (homogeneous) parameters " <+> prettyTCM hpars
+      reportSDoc "tc.lhs.unify" 40 $ addContext (varTel s `abstract` eqTel s) $
+        "Found equation at datatype " <+> prettyTCM d
+         <+> " with parameters " <+> prettyTCM (raise (size (eqTel s) - k) pars)
       case (u, v) of
-        (Con c _ _   , Con c' _ _  ) | c == c' -> return $ Injectivity k a d hpars ixs c
-        (Con c _ _   , Con c' _ _  ) -> return $ Conflict k a d hpars u v
-        (Var i []  , v         ) -> ifOccursStronglyRigid i v $ return $ Cycle k a d hpars i v
-        (u         , Var j []  ) -> ifOccursStronglyRigid j u $ return $ Cycle k a d hpars j u
+        (Con c _ _   , Con c' _ _  ) | c == c' -> return $ Injectivity k a d pars ixs c
+        (Con c _ _   , Con c' _ _  ) -> return $ Conflict k a d pars u v
+        (Var i []  , v         ) -> ifOccursStronglyRigid i v $ return $ Cycle k a d pars i v
+        (u         , Var j []  ) -> ifOccursStronglyRigid j u $ return $ Cycle k a d pars j u
         _ -> mzero
     _ -> mzero
   where
-    ifOccursStronglyRigid i u ret = case occurrence i u of
-      StronglyRigid -> ret
-      NoOccurrence  -> mzero
-      _ -> do
-        u <- liftTCM $ normalise u
-        case occurrence i u of
-          StronglyRigid -> ret
+    ifOccursStronglyRigid i u ret = do
+        -- Call forceNotFree to reduce u as far as possible
+        -- around any occurrences of i
+        (_ , u) <- forceNotFree (singleton i) u
+        case flexRigOccurrenceIn i u of
+          Just StronglyRigid -> ret
           _ -> mzero
 
 checkEqualityStrategy :: Int -> UnifyStrategy
 checkEqualityStrategy k s = do
-  let Equal (Dom _ _ a) u v = getEquality k s
+  let Equal Dom{unDom = a} u v = getEquality k s
       n = eqCount s
   ha <- fromMaybeMP $ isHom n a
   return $ Deletion k ha u v
@@ -671,8 +395,9 @@ checkEqualityStrategy k s = do
 literalStrategy :: Int -> UnifyStrategy
 literalStrategy k s = do
   let n = eqCount s
-  Equal (Dom _ _ a) u v <- liftTCM $ eqUnLevel $ getEquality k s
+  Equal Dom{unDom = a} u v <- eqUnLevel $ getEquality k s
   ha <- fromMaybeMP $ isHom n a
+  (u, v) <- reduce (u, v)
   case (u , v) of
     (Lit l1 , Lit l2)
      | l1 == l2  -> return $ Deletion k ha u v
@@ -681,29 +406,33 @@ literalStrategy k s = do
 
 etaExpandVarStrategy :: Int -> UnifyStrategy
 etaExpandVarStrategy k s = do
-  Equal (Dom _ _ a) u v <- liftTCM $ eqUnLevel (getEquality k s)
+  Equal Dom{unDom = a} u v <- eqUnLevel =<< getReducedEquality k s
   shouldEtaExpand u v a s `mplus` shouldEtaExpand v u a s
   where
     -- TODO: use IsEtaVar to check if the term is a variable
     shouldEtaExpand :: Term -> Term -> Type -> UnifyStrategy
     shouldEtaExpand (Var i es) v a s = do
       fi       <- fromMaybeMP $ findFlexible i (flexVars s)
-      liftTCM $ reportSDoc "tc.lhs.unify" 50 $
-        text "Found flexible variable " <+> text (show i)
-      -- Issue 2888: Do this if there are projections or if it's a singleton
+      reportSDoc "tc.lhs.unify" 50 $
+        "Found flexible variable " <+> text (show i)
+      -- Issue 2888: Do this if there are only projections or if it's a singleton
       -- record or if it's unified against a record constructor term. Basically
       -- we need to avoid EtaExpandEquation if EtaExpandVar is possible, or the
       -- forcing translation is unhappy.
-      let Dom _ _ b = getVarTypeUnraised (varCount s - 1 - i) s
-      (d, pars) <- catMaybesMP $ liftTCM $ isEtaRecordType b
+      let k  = varCount s - 1 - i -- position of var i in telescope
+          b0 = unDom $ getVarTypeUnraised k s
+      b         <- addContext (telFromList $ take k $ telToList $ varTel s) $ reduce b0
+      (d, pars) <- catMaybesMP $ isEtaRecordType b
       ps        <- fromMaybeMP $ allProjElims es
-      sing      <- liftTCM $ (Right True ==) <$> isSingletonRecord d pars
-      con       <- liftTCM $ isRecCon v  -- is the other term a record constructor?
-      guard $ not (null ps) || sing || con
-      liftTCM $ reportSDoc "tc.lhs.unify" 50 $
-        text "with projections " <+> prettyTCM (map snd ps)
-      liftTCM $ reportSDoc "tc.lhs.unify" 50 $
-        text "at record type " <+> prettyTCM d
+      guard =<< orM
+        [ pure $ not $ null ps
+        , isRecCon v  -- is the other term a record constructor?
+        , (Right True ==) <$> runBlocked (isSingletonRecord d pars)
+        ]
+      reportSDoc "tc.lhs.unify" 50 $
+        "with projections " <+> prettyTCM (map snd ps)
+      reportSDoc "tc.lhs.unify" 50 $
+        "at record type " <+> prettyTCM d
       return $ EtaExpandVar fi d pars
     shouldEtaExpand _ _ _ _ = mzero
 
@@ -712,16 +441,18 @@ etaExpandVarStrategy k s = do
 
 etaExpandEquationStrategy :: Int -> UnifyStrategy
 etaExpandEquationStrategy k s = do
-  let Equal (Dom _ _ a) u v = getEqualityUnraised k s
-  (d, pars) <- catMaybesMP $ liftTCM $ addContext tel $ isEtaRecordType a
-  sing <- liftTCM $ (Right True ==) <$> isSingletonRecord d pars
-  projLeft <- liftTCM $ shouldProject u
-  projRight <- liftTCM $ shouldProject v
-  guard $ sing || projLeft || projRight
+  -- Andreas, 2019-02-23, re #3578, is the following reduce redundant?
+  Equal Dom{unDom = a} u v <- getReducedEqualityUnraised k s
+  (d, pars) <- catMaybesMP $ addContext tel $ isEtaRecordType a
+  guard =<< orM
+    [ (Right True ==) <$> runBlocked (isSingletonRecord d pars)
+    , shouldProject u
+    , shouldProject v
+    ]
   return $ EtaExpandEquation k d pars
   where
-    shouldProject :: Term -> TCM Bool
-    shouldProject u = case u of
+    shouldProject :: PureTCM m => Term -> m Bool
+    shouldProject = \case
       Def f es   -> usesCopatterns f
       Con c _ _  -> isJust <$> isRecordConstructor (conName c)
 
@@ -733,19 +464,19 @@ etaExpandEquationStrategy k s = do
       Level _    -> __IMPOSSIBLE__
       MetaV _ _  -> return False
       DontCare _ -> return False
-      Dummy s    -> __IMPOSSIBLE_VERBOSE__ s
+      Dummy s _  -> __IMPOSSIBLE_VERBOSE__ s
 
     tel = varTel s `abstract` telFromList (take k $ telToList $ eqTel s)
 
 simplifySizesStrategy :: Int -> UnifyStrategy
 simplifySizesStrategy k s = do
-  isSizeName <- liftTCM isSizeNameTest
-  let Equal (Dom _ _ a) u v = getEquality k s
+  isSizeName <- isSizeNameTest
+  Equal Dom{unDom = a} u v <- getReducedEquality k s
   case unEl a of
     Def d _ -> do
       guard $ isSizeName d
-      su <- liftTCM $ sizeView u
-      sv <- liftTCM $ sizeView v
+      su <- sizeView u
+      sv <- sizeView v
       case (su, sv) of
         (SizeSuc u, SizeSuc v) -> return $ StripSizeSuc k u v
         (SizeSuc u, SizeInf  ) -> return $ StripSizeSuc k u v
@@ -755,20 +486,22 @@ simplifySizesStrategy k s = do
 
 injectiveTypeConStrategy :: Int -> UnifyStrategy
 injectiveTypeConStrategy k s = do
-  injTyCon <- liftTCM $ optInjectiveTypeConstructors <$> pragmaOptions
+  injTyCon <- optInjectiveTypeConstructors <$> pragmaOptions
   guard injTyCon
-  eq <- liftTCM $ eqUnLevel $ getEquality k s
+  eq <- eqUnLevel =<< getReducedEquality k s
   case eq of
     Equal a u@(Def d es) v@(Def d' es') | d == d' -> do
       -- d must be a data, record or axiom
-      def <- liftTCM $ getConstInfo d
+      def <- getConstInfo d
       guard $ case theDef def of
                 Datatype{} -> True
                 Record{}   -> True
                 Axiom{}    -> True
+                DataOrRecSig{} -> True
                 AbstractDefn{} -> False -- True triggers issue #2250
                 Function{}   -> False
                 Primitive{}  -> False
+                PrimitiveSort{} -> __IMPOSSIBLE__
                 GeneralizableVar{} -> __IMPOSSIBLE__
                 Constructor{} -> __IMPOSSIBLE__  -- Never a type!
       let us = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
@@ -778,11 +511,11 @@ injectiveTypeConStrategy k s = do
 
 injectivePragmaStrategy :: Int -> UnifyStrategy
 injectivePragmaStrategy k s = do
-  eq <- liftTCM $ eqUnLevel $ getEquality k s
+  eq <- eqUnLevel =<< getReducedEquality k s
   case eq of
     Equal a u@(Def d es) v@(Def d' es') | d == d' -> do
       -- d must have an injective pragma
-      def <- liftTCM $ getConstInfo d
+      def <- getConstInfo d
       guard $ defInjective def
       let us = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
           vs = fromMaybe __IMPOSSIBLE__ $ allApplyElims es'
@@ -791,8 +524,10 @@ injectivePragmaStrategy k s = do
 
 skipIrrelevantStrategy :: Int -> UnifyStrategy
 skipIrrelevantStrategy k s = do
-  let Equal a _ _ = getEquality k s
-  guard $ isIrrelevantOrProp a
+  let Equal a _ _ = getEquality k s                                 -- reduce not necessary
+  addContext (varTel s `abstract` eqTel s) $
+    guard . (== Right True) =<< runBlocked (isIrrelevantOrPropM a)  -- reduction takes place here
+  -- TODO: do something in case the above is blocked (i.e. `Left b`)
   return $ SkipIrrelevantEquation k
 
 
@@ -800,118 +535,40 @@ skipIrrelevantStrategy k s = do
 -- Actually doing the unification
 ----------------------------------------------------
 
-data UnifyLogEntry
-  = UnificationDone  UnifyState
-  | UnificationStep  UnifyState UnifyStep
-
-type UnifyLog = [UnifyLogEntry]
-
-data UnifyOutput = UnifyOutput
-  { unifySubst :: PatternSubstitution
-  , unifyProof :: PatternSubstitution
-  , unifyLog   :: UnifyLog
-  }
-
-instance Semigroup UnifyOutput where
-  x <> y = UnifyOutput
-    { unifySubst = unifySubst y `composeS` unifySubst x
-    , unifyProof = unifyProof y `composeS` unifyProof x
-    , unifyLog   = unifyLog x ++ unifyLog y
-    }
-
-instance Monoid UnifyOutput where
-  mempty  = UnifyOutput IdS IdS []
-  mappend = (<>)
-
-type UnifyM a = WriterT UnifyOutput TCM a
-
-tellUnifySubst :: PatternSubstitution -> UnifyM ()
-tellUnifySubst sub = tell $ UnifyOutput sub IdS []
-
-tellUnifyProof :: PatternSubstitution -> UnifyM ()
-tellUnifyProof sub = tell $ UnifyOutput IdS sub []
-
-writeUnifyLog :: UnifyLogEntry -> UnifyM ()
-writeUnifyLog x = tell $ UnifyOutput IdS IdS [x]
-
-runUnifyM :: UnifyM a -> TCM (a,UnifyOutput)
-runUnifyM = runWriterT
-
-unifyStep :: UnifyState -> UnifyStep -> UnifyM (UnificationResult' UnifyState)
-
+unifyStep
+  :: (PureTCM m, MonadWriter UnifyOutput m, MonadError TCErr m)
+  => UnifyState -> UnifyStep -> m (UnificationResult' UnifyState)
 unifyStep s Deletion{ deleteAt = k , deleteType = a , deleteLeft = u , deleteRight = v } = do
     -- Check definitional equality of u and v
-    isReflexive <- liftTCM $ addContext (varTel s) $ do
-      dontAssignMetas $ disableDestructiveUpdate $ noConstraints $
-        equalTerm a u v
-      return Nothing
-      `catchError` \err -> return $ Just err
-    withoutK <- liftTCM $ optWithoutK <$> pragmaOptions
+    isReflexive <- addContext (varTel s) $ runBlocked $ pureEqualTerm a u v
+    withoutK <- withoutKOption
+    splitOnStrict <- asksTC envSplitOnStrict
     case isReflexive of
-      Just err     -> return $ DontKnow []
-      _ | withoutK -> return $ DontKnow [UnifyReflexiveEq (varTel s) a u]
-      _            -> do
+      Left block   -> return $ UnifyBlocked block
+      Right False  -> return $ UnifyStuck []
+      Right True | withoutK && not splitOnStrict
+                   -> return $ UnifyStuck [UnifyReflexiveEq (varTel s) a u]
+      Right True   -> do
         let (s', sigma) = solveEq k u s
         tellUnifyProof sigma
-        Unifies <$> liftTCM (reduceEqTel s')
+        Unifies <$> lensEqTel reduce s'
 
-unifyStep s Solution{ solutionAt   = k
-                    , solutionType = Dom info _ a
-                    , solutionVar  = fi@FlexibleVar{ flexVar = i }
-                    , solutionTerm = u } = do
-  let m = varCount s
-
-  -- Check that the type of the variable is equal to the type of the equation
-  -- (not just a subtype), otherwise we cannot instantiate (see Issue 2407).
-  let Dom info' _ a' = getVarType (m-1-i) s
-  equalTypes <- liftTCM $ addContext (varTel s) $ do
-    reportSDoc "tc.lhs.unify" 45 $ text "Equation type: " <+> prettyTCM a
-    reportSDoc "tc.lhs.unify" 45 $ text "Variable type: " <+> prettyTCM a'
-    dontAssignMetas $ disableDestructiveUpdate $ noConstraints $
-      equalType a a'
-    return Nothing
-    `catchError` \err -> return $ Just err
-  -- The conditions on the relevances are as follows (see #2640):
-  -- - If the type of the equation is relevant, then the solution must be
-  --   usable in a relevant position.
-  -- - If the type of the equation is (shape-)irrelevant, then the solution
-  --   must be usable in a μ-relevant position where μ is the relevance
-  --   of the variable being solved.
-  let eqrel  = getRelevance info
-      varrel = getRelevance info'
-      rel    = if NonStrict `moreRelevant` eqrel then varrel else Relevant
-  reportSDoc "tc.lhs.unify" 65 $ text $ "Equation relevance: " ++ show eqrel
-  reportSDoc "tc.lhs.unify" 65 $ text $ "Variable relevance: " ++ show varrel
-  reportSDoc "tc.lhs.unify" 65 $ text $ "Solution must be usable in a " ++ show rel ++ " position."
-  usable <- liftTCM $ addContext (varTel s) $ usableRel rel u
-  reportSDoc "tc.lhs.unify" 45 $ text "Relevance ok: " <+> prettyTCM usable
-  case equalTypes of
-    Just err -> return $ DontKnow []
-    Nothing | usable -> caseMaybeM (trySolveVar (m-1-i) u s)
-      (return $ DontKnow [UnifyRecursiveEq (varTel s) a i u])
-      (\(s',sub) -> do
-        tellUnifySubst sub
-        let (s'', sigma) = solveEq k (applyPatSubst sub u) s'
-        tellUnifyProof sigma
-        Unifies <$> liftTCM (reduce s''))
-    Nothing -> return $ DontKnow []
-  where
-    trySolveVar i u s = case solveVar i u s of
-      Just x  -> return $ Just x
-      Nothing -> do
-        u <- liftTCM $ normalise u
-        s <- liftTCM $ normaliseVarTel s
-        return $ solveVar i u s
+unifyStep s step@Solution{} = solutionStep RetryNormalised s step
 
 unifyStep s (Injectivity k a d pars ixs c) = do
-  withoutK <- liftTCM $ optWithoutK <$> pragmaOptions
-  let n = eqCount s
+  ifM (consOfHIT $ conName c) (return $ UnifyStuck []) $ do
+  withoutK <- withoutKOption
+
+  -- Split equation telescope into parts before and after current equation
+  let (eqListTel1, _ : eqListTel2) = splitAt k $ telToList $ eqTel s
+      (eqTel1, eqTel2) = (telFromList eqListTel1, telFromList eqListTel2)
 
   -- Get constructor telescope and target indices
-  ctype <- (`piApply` pars) . defType <$> liftTCM (getConInfo c)
-  addContext (varTel s) $ reportSDoc "tc.lhs.unify" 40 $
-    text "Constructor type: " <+> prettyTCM ctype
-  TelV ctel ctarget <- liftTCM $ telView ctype
+  cdef  <- getConInfo c
+  let ctype  = defType cdef `piApply` pars
+  addContext (varTel s `abstract` eqTel1) $ reportSDoc "tc.lhs.unify" 40 $
+    "Constructor type: " <+> prettyTCM ctype
+  TelV ctel ctarget <- addContext (varTel s `abstract` eqTel1) $ telView ctype
   let cixs = case unEl ctarget of
                Def d' es | d == d' ->
                  let args = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
@@ -919,13 +576,9 @@ unifyStep s (Injectivity k a d pars ixs c) = do
                _ -> __IMPOSSIBLE__
 
   -- Get index telescope of the datatype
-  dtype    <- (`piApply` pars) . defType <$> liftTCM (getConstInfo d)
-  addContext (varTel s) $ reportSDoc "tc.lhs.unify" 40 $
-    text "Datatype type: " <+> prettyTCM dtype
-
-  -- Split equation telescope into parts before and after current equation
-  let (eqListTel1, _ : eqListTel2) = splitAt k $ telToList $ eqTel s
-      (eqTel1, eqTel2) = (telFromList eqListTel1, telFromList eqListTel2)
+  dtype    <- (`piApply` pars) . defType <$> getConstInfo d
+  addContext (varTel s `abstract` eqTel1) $ reportSDoc "tc.lhs.unify" 40 $
+    "Datatype type: " <+> prettyTCM dtype
 
   -- This is where the magic of higher-dimensional unification happens
   -- We need to generalize the indices `ixs` to the target indices of the
@@ -933,25 +586,34 @@ unifyStep s (Injectivity k a d pars ixs c) = do
   -- recursively (this doesn't get stuck in a loop because a type should
   -- never be indexed over itself). Note the similarity with the
   -- computeNeighbourhood function in Agda.TypeChecking.Coverage.
-  let hduTel = eqTel1 `abstract` raise (size eqTel1) ctel
-  res <- liftTCM $ addContext (varTel s) $ unifyIndices
+  let hduTel = eqTel1 `abstract` ctel
+      notforced = replicate (size hduTel) NotForced
+
+  -- The left inverse computed here is not actually used when computing
+  -- a left inverse for the overall match, so as a slight optimisation
+  -- we just don't bother computing it. __IMPOSSIBLE__ because that
+  -- field in the result is never evaluated.
+  res <- addContext (varTel s) $ unifyIndices' (Just __IMPOSSIBLE__)
            hduTel
-           (allFlexVars hduTel)
-           (raise (size hduTel) dtype)
+           (allFlexVars notforced hduTel)
+           (raise (size ctel) dtype)
            (raise (size ctel) ixs)
-           (raiseFrom (size ctel) (size eqTel1) cixs)
+           cixs
   case res of
     -- Higher-dimensional unification can never end in a conflict,
     -- because `cong c1 ...` and `cong c2 ...` don't even have the
     -- same type for distinct constructors c1 and c2.
     NoUnify _ -> __IMPOSSIBLE__
 
+    -- Higher-dimensional unification is blocked: propagate
+    UnifyBlocked block -> return $ UnifyBlocked block
+
     -- Higher-dimensional unification has failed. If not --without-K,
     -- we can simply ignore the higher-dimensional equations and
     -- simplify the equation as in the non-indexed case.
-    DontKnow _ | not withoutK -> do
+    UnifyStuck _ | not withoutK -> do
       -- using the same variable names as in the case where hdu succeeds.
-      let eqTel1' = eqTel1 `abstract` raise (size eqTel1) ctel
+      let eqTel1' = eqTel1 `abstract` ctel
           rho1    = raiseS (size ctel)
           ceq     = ConP c noConPatternInfo $ teleNamedArgs ctel
           rho3    = consS ceq rho1
@@ -961,13 +623,13 @@ unifyStep s (Injectivity k a d pars ixs c) = do
 
       tellUnifyProof rho
 
-      eqTel' <- liftTCM $ reduce eqTel'
+      eqTel' <- addContext (varTel s) $ reduce eqTel'
 
       -- Compute new lhs and rhs by matching the old ones against rho
-      (lhs', rhs') <- liftTCM . reduce =<< do
+      (lhs', rhs') <- addContext (varTel s) $ do
         let ps = applySubst rho $ teleNamedArgs $ eqTel s
-        (lhsMatch, _) <- liftTCM $ runReduceM $ Match.matchPatterns ps $ eqLHS s
-        (rhsMatch, _) <- liftTCM $ runReduceM $ Match.matchPatterns ps $ eqRHS s
+        (lhsMatch, _) <- Match.matchPatterns ps $ eqLHS s
+        (rhsMatch, _) <- Match.matchPatterns ps $ eqRHS s
         case (lhsMatch, rhsMatch) of
           (Match.Yes _ lhs', Match.Yes _ rhs') -> return
             (reverse $ Match.matchedArgs __IMPOSSIBLE__ (size eqTel') lhs',
@@ -977,13 +639,13 @@ unifyStep s (Injectivity k a d pars ixs c) = do
       return $ Unifies $ s { eqTel = eqTel' , eqLHS = lhs' , eqRHS = rhs' }
 
 
-    DontKnow _ -> let n           = eqCount s
-                      Equal (Dom _ _ a) u v = getEquality k s
-                  in return $ DontKnow [UnifyIndicesNotVars
-                       (varTel s `abstract` eqTel s) a
-                       (raise n u) (raise n v) (raise (n-k) ixs)]
+    UnifyStuck _ -> let n           = eqCount s
+                        Equal Dom{unDom = a} u v = getEquality k s
+                    in return $ UnifyStuck [UnifyIndicesNotVars
+                         (varTel s `abstract` eqTel s) a
+                         (raise n u) (raise n v) (raise (n-k) ixs)]
 
-    Unifies (eqTel1', rho0, _) -> do
+    Unifies (eqTel1', rho0, _, _) -> do
       -- Split ps0 into parts for eqTel1 and ctel
       let (rho1, rho2) = splitS (size ctel) rho0
 
@@ -996,13 +658,13 @@ unifyStep s (Injectivity k a d pars ixs c) = do
 
       tellUnifyProof rho
 
-      eqTel' <- liftTCM $ reduce eqTel'
+      eqTel' <- addContext (varTel s) $ reduce eqTel'
 
       -- Compute new lhs and rhs by matching the old ones against rho
-      (lhs', rhs') <- liftTCM . reduce =<< do
+      (lhs', rhs') <- addContext (varTel s) $ do
         let ps = applySubst rho $ teleNamedArgs $ eqTel s
-        (lhsMatch, _) <- liftTCM $ runReduceM $ Match.matchPatterns ps $ eqLHS s
-        (rhsMatch, _) <- liftTCM $ runReduceM $ Match.matchPatterns ps $ eqRHS s
+        (lhsMatch, _) <- Match.matchPatterns ps $ eqLHS s
+        (rhsMatch, _) <- Match.matchPatterns ps $ eqRHS s
         case (lhsMatch, rhsMatch) of
           (Match.Yes _ lhs', Match.Yes _ rhs') -> return
             (reverse $ Match.matchedArgs __IMPOSSIBLE__ (size eqTel') lhs',
@@ -1014,35 +676,44 @@ unifyStep s (Injectivity k a d pars ixs c) = do
 unifyStep s Conflict
   { conflictLeft  = u
   , conflictRight = v
-  } = return $ NoUnify $ UnifyConflict (varTel s) u v
-
+  } =
+  case u of
+    Con h _ _ -> do
+      ifM (consOfHIT $ conName h) (return $ UnifyStuck []) $ do
+        return $ NoUnify $ UnifyConflict (varTel s) u v
+    _ -> __IMPOSSIBLE__
 unifyStep s Cycle
   { cycleVar        = i
   , cycleOccursIn   = u
-  } = return $ NoUnify $ UnifyCycle (varTel s) i u
+  } =
+  case u of
+    Con h _ _ -> do
+      ifM (consOfHIT $ conName h) (return $ UnifyStuck []) $ do
+        return $ NoUnify $ UnifyCycle (varTel s) i u
+    _ -> __IMPOSSIBLE__
 
 unifyStep s EtaExpandVar{ expandVar = fi, expandVarRecordType = d , expandVarParameters = pars } = do
-  delta   <- liftTCM $ (`apply` pars) <$> getRecordFieldTypes d
-  c       <- liftTCM $ getRecordConstructor d
+  recd <- fromMaybe __IMPOSSIBLE__ <$> isRecord d
+  let delta = recTel recd `apply` pars
+      c     = recConHead recd
   let nfields         = size delta
       (varTel', rho)  = expandTelescopeVar (varTel s) (m-1-i) delta c
-      projectFlexible = [ FlexibleVar (flexHiding fi) (flexOrigin fi) (projFlexKind j) (flexPos fi) (i+j) | j <- [0..nfields-1] ]
+      projectFlexible = [ FlexibleVar (getArgInfo fi) (flexForced fi) (projFlexKind j) (flexPos fi) (i+j) | j <- [0..nfields-1] ]
   tellUnifySubst $ rho
-  Unifies <$> liftTCM (reduce $ UState
+  return $ Unifies $ UState
     { varTel   = varTel'
     , flexVars = projectFlexible ++ liftFlexibles nfields (flexVars s)
     , eqTel    = applyPatSubst rho $ eqTel s
     , eqLHS    = applyPatSubst rho $ eqLHS s
     , eqRHS    = applyPatSubst rho $ eqRHS s
-    })
+    }
   where
     i = flexVar fi
     m = varCount s
-    n = eqCount s
 
     projFlexKind :: Int -> FlexibleVarKind
     projFlexKind j = case flexKind fi of
-      RecordFlex ks -> fromMaybe ImplicitFlex $ ks !!! j
+      RecordFlex ks -> indexWithDefault ImplicitFlex ks j
       ImplicitFlex  -> ImplicitFlex
       DotFlex       -> DotFlex
       OtherFlex     -> OtherFlex
@@ -1054,22 +725,24 @@ unifyStep s EtaExpandVar{ expandVar = fi, expandVarRecordType = d , expandVarPar
     liftFlexibles n fs = mapMaybe (traverse $ liftFlexible n) fs
 
 unifyStep s EtaExpandEquation{ expandAt = k, expandRecordType = d, expandParameters = pars } = do
-  delta <- liftTCM $ (`apply` pars) <$> getRecordFieldTypes d
-  c     <- liftTCM $ getRecordConstructor d
+  recd  <- fromMaybe __IMPOSSIBLE__ <$> isRecord d
+  let delta = recTel recd `apply` pars
+      c     = recConHead recd
   lhs   <- expandKth $ eqLHS s
   rhs   <- expandKth $ eqRHS s
   let (tel, sigma) = expandTelescopeVar (eqTel s) k delta c
   tellUnifyProof sigma
-  Unifies <$> liftTCM (reduceEqTel $ s
+  Unifies <$> do
+   lensEqTel reduce $ s
     { eqTel    = tel
     , eqLHS    = lhs
     , eqRHS    = rhs
-    })
+    }
   where
     expandKth us = do
       let (us1,v:us2) = fromMaybe __IMPOSSIBLE__ $ splitExactlyAt k us
-      vs <- liftTCM $ snd <$> etaExpandRecord d pars (unArg v)
-      vs <- liftTCM $ reduce vs
+      vs <- snd <$> etaExpandRecord d pars (unArg v)
+      vs <- reduce vs
       return $ us1 ++ vs ++ us2
 
 unifyStep s LitConflict
@@ -1079,8 +752,8 @@ unifyStep s LitConflict
   } = return $ NoUnify $ UnifyConflict (varTel s) (Lit l) (Lit l')
 
 unifyStep s (StripSizeSuc k u v) = do
-  sizeTy <- liftTCM sizeType
-  sizeSu <- liftTCM $ sizeSuc 1 (var 0)
+  sizeTy <- sizeType
+  sizeSu <- sizeSuc 1 (var 0)
   let n          = eqCount s
       sub        = liftS (n-k-1) $ consS sizeSu $ raiseS 1
       eqFlatTel  = flattenTel $ eqTel s
@@ -1096,56 +769,235 @@ unifyStep s (StripSizeSuc k u v) = do
 
 unifyStep s (SkipIrrelevantEquation k) = do
   let lhs = eqLHS s
-      (s', sigma) = solveEq k (DontCare $ unArg $ lhs !! k) s
+      (s', sigma) = solveEq k (DontCare $ unArg $ indexWithDefault __IMPOSSIBLE__ lhs k) s
   tellUnifyProof sigma
   return $ Unifies s'
 
 unifyStep s (TypeConInjectivity k d us vs) = do
-  dtype <- defType <$> liftTCM (getConstInfo d)
-  TelV dtel _ <- liftTCM $ telView dtype
-  let n   = eqCount s
-      m   = size dtel
-      deq = Def d $ map Apply $ teleArgs dtel
+  dtype <- defType <$> getConstInfo d
+  TelV dtel _ <- telView dtype
+  let deq = Def d $ map Apply $ teleArgs dtel
   -- TODO: tellUnifyProof ???
   -- but d is not a constructor...
-  Unifies <$> liftTCM (reduceEqTel $ s
+  Unifies <$> do
+   lensEqTel reduce $ s
     { eqTel = dtel `abstract` applyUnder k (eqTel s) (raise k deq)
     , eqLHS = us ++ dropAt k (eqLHS s)
     , eqRHS = vs ++ dropAt k (eqRHS s)
-    })
+    }
 
-unify :: UnifyState -> UnifyStrategy -> UnifyM (UnificationResult' UnifyState)
+data RetryNormalised = RetryNormalised | DontRetryNormalised
+  deriving (Eq, Show)
+
+solutionStep
+  :: (PureTCM m, MonadWriter UnifyOutput m)
+  => RetryNormalised
+  -> UnifyState
+  -> UnifyStep
+  -> m (UnificationResult' UnifyState)
+solutionStep retry s
+  step@Solution{ solutionAt   = k
+               , solutionType = dom@Dom{ unDom = a }
+               , solutionVar  = fi@FlexibleVar{ flexVar = i }
+               , solutionTerm = u } = do
+  let m = varCount s
+
+  -- Now we have to be careful about forced variables in `u`. If they appear
+  -- in pattern positions we need to bind them there rather in their forced positions. We can safely
+  -- ignore non-pattern positions and forced pattern positions, because in that case there will be
+  -- other equations where the variable can be bound.
+  -- NOTE: If we're doing make-case we ignore forced variables. This is safe since we take the
+  -- result of unification and build user clauses that will be checked again with forcing turned on.
+  inMakeCase <- viewTC eMakeCase
+  let forcedVars | inMakeCase = IntMap.empty
+                 | otherwise  = IntMap.fromList [ (flexVar fi, getModality fi) | fi <- flexVars s,
+                                                                                 flexForced fi == Forced ]
+  (p, bound) <- patternBindingForcedVars forcedVars u
+
+  -- To maintain the invariant that each variable in varTel is bound exactly once in the pattern
+  -- substitution we need to turn the bound variables in `p` into dot patterns in the rest of the
+  -- substitution.
+  let dotSub = foldr composeS idS [ inplaceS i (dotP (Var i [])) | i <- IntMap.keys bound ]
+
+  -- We moved the binding site of some forced variables, so we need to update their modalities in
+  -- the telescope. The new modality is the combination of the modality of the variable we are
+  -- instantiating and the modality of the binding site in the pattern (returned by
+  -- patternBindingForcedVars).
+  let updModality md vars tel
+        | IntMap.null vars = tel
+        | otherwise        = telFromList $ zipWith upd (downFrom $ size tel) (telToList tel)
+        where
+          upd i a | Just md' <- IntMap.lookup i vars = setModality (composeModality md md') a
+                  | otherwise                        = a
+  s <- return $ s { varTel = updModality (getModality fi) bound (varTel s) }
+
+  reportSDoc "tc.lhs.unify.force" 45 $ vcat
+    [ "forcedVars =" <+> pretty (IntMap.keys forcedVars)
+    , "u          =" <+> prettyTCM u
+    , "p          =" <+> prettyTCM p
+    , "bound      =" <+> pretty (IntMap.keys bound)
+    , "dotSub     =" <+> pretty dotSub ]
+
+  -- Check that the type of the variable is equal to the type of the equation
+  -- (not just a subtype), otherwise we cannot instantiate (see Issue 2407).
+  let dom'@Dom{ unDom = a' } = getVarType (m-1-i) s
+  equalTypes <- addContext (varTel s) $ runBlocked $ do
+    reportSDoc "tc.lhs.unify" 45 $ "Equation type: " <+> prettyTCM a
+    reportSDoc "tc.lhs.unify" 45 $ "Variable type: " <+> prettyTCM a'
+    pureEqualType a a'
+
+  -- The conditions on the relevances are as follows (see #2640):
+  -- - If the type of the equation is relevant, then the solution must be
+  --   usable in a relevant position.
+  -- - If the type of the equation is (shape-)irrelevant, then the solution
+  --   must be usable in a μ-relevant position where μ is the relevance
+  --   of the variable being solved.
+  --
+  -- Jesper, Andreas, 2018-10-17: the quantity of the equation is morally
+  -- always @Quantity0@, since the indices of the data type are runtime erased.
+  -- Thus, we need not change the quantity of the solution.
+  envmod <- viewTC eModality
+  let eqrel  = getRelevance dom
+      eqmod  = getModality dom
+      varmod = getModality dom'
+      mod    = applyUnless (NonStrict `moreRelevant` eqrel) (setRelevance eqrel)
+             $ applyUnless (usableQuantity envmod) (setQuantity zeroQuantity)
+             $ varmod
+  reportSDoc "tc.lhs.unify" 65 $ text $ "Equation modality: " ++ show (getModality dom)
+  reportSDoc "tc.lhs.unify" 65 $ text $ "Variable modality: " ++ show varmod
+  reportSDoc "tc.lhs.unify" 65 $ text $ "Solution must be usable in a " ++ show mod ++ " position."
+  -- Andreas, 2018-10-18
+  -- Currently, the modality check has problems with meta-variables created in the type signature,
+  -- and thus, in quantity 0, that get into terms using the unifier, and there are checked to be
+  -- non-erased, i.e., have quantity ω.
+  -- Ulf, 2019-12-13. We still do it though.
+  -- Andrea, 2020-10-15: It looks at meta instantiations now.
+  eusable <- addContext (varTel s) $ runExceptT $ usableMod mod u
+  caseEitherM (return eusable) (return . UnifyBlocked) $ \ usable -> do
+
+  reportSDoc "tc.lhs.unify" 45 $ "Modality ok: " <+> prettyTCM usable
+  unless usable $ reportSDoc "tc.lhs.unify" 65 $ "Rejected solution: " <+> prettyTCM u
+
+  -- We need a Flat equality to solve a Flat variable.
+  -- This also ought to take care of the need for a usableCohesion check.
+  if not (getCohesion eqmod `moreCohesion` getCohesion varmod) then return $ UnifyStuck [] else do
+
+  case equalTypes of
+    Left block  -> return $ UnifyBlocked block
+    Right False -> return $ UnifyStuck []
+    Right True | usable ->
+      case solveVar (m - 1 - i) p s of
+        Nothing | retry == RetryNormalised -> do
+          u <- normalise u
+          s <- lensVarTel normalise s
+          solutionStep DontRetryNormalised s step{ solutionTerm = u }
+        Nothing ->
+          return $ UnifyStuck [UnifyRecursiveEq (varTel s) a i u]
+        Just (s', sub) -> do
+          let rho = sub `composeS` dotSub
+          tellUnifySubst rho
+          let (s'', sigma) = solveEq k (applyPatSubst rho u) s'
+          tellUnifyProof sigma
+          return $ Unifies s''
+          -- Andreas, 2019-02-23, issue #3578: do not eagerly reduce
+          -- Unifies <$> liftTCM (reduce s'')
+    Right True -> return $ UnifyStuck [UnifyUnusableModality (varTel s) a i u mod]
+solutionStep _ _ _ = __IMPOSSIBLE__
+
+unify
+  :: (PureTCM m, MonadWriter UnifyLog' m, MonadError TCErr m)
+  => UnifyState -> UnifyStrategy -> m (UnificationResult' UnifyState)
 unify s strategy = if isUnifyStateSolved s
                    then return $ Unifies s
                    else tryUnifyStepsAndContinue (strategy s)
   where
-    tryUnifyStepsAndContinue :: ListT TCM UnifyStep -> UnifyM (UnificationResult' UnifyState)
+    tryUnifyStepsAndContinue
+      :: (PureTCM m, MonadWriter UnifyLog' m, MonadError TCErr m)
+      => ListT m UnifyStep -> m (UnificationResult' UnifyState)
     tryUnifyStepsAndContinue steps = do
-      x <- foldListT tryUnifyStep failure $ liftListT lift steps
+      x <- foldListT tryUnifyStep failure steps
       case x of
-        Unifies s'   -> unify s' strategy
-        NoUnify err  -> return $ NoUnify err
-        DontKnow err -> return $ DontKnow err
+        Unifies s'     -> unify s' strategy
+        NoUnify err    -> return $ NoUnify err
+        UnifyBlocked b -> return $ UnifyBlocked b
+        UnifyStuck err -> return $ UnifyStuck err
 
-    tryUnifyStep :: UnifyStep
-                 -> UnifyM (UnificationResult' UnifyState)
-                 -> UnifyM (UnificationResult' UnifyState)
+    tryUnifyStep :: (PureTCM m, MonadWriter UnifyLog' m, MonadError TCErr m)
+                 => UnifyStep
+                 -> m (UnificationResult' UnifyState)
+                 -> m (UnificationResult' UnifyState)
     tryUnifyStep step fallback = do
       addContext (varTel s) $
-        reportSDoc "tc.lhs.unify" 20 $ text "trying unifyStep" <+> prettyTCM step
-      x <- unifyStep s step
+        reportSDoc "tc.lhs.unify" 20 $ "trying unifyStep" <+> prettyTCM step
+      (x, output) <- runWriterT $ unifyStep s step
       case x of
         Unifies s'   -> do
-          reportSDoc "tc.lhs.unify" 20 $ text "unifyStep successful."
-          reportSDoc "tc.lhs.unify" 20 $ text "new unifyState:" <+> prettyTCM s'
-          writeUnifyLog $ UnificationStep s step
+          reportSDoc "tc.lhs.unify" 20 $ "unifyStep successful."
+          reportSDoc "tc.lhs.unify" 20 $ "new unifyState:" <+> prettyTCM s'
+          -- tell output
+          writeUnifyLog $ (UnificationStep s step output,s')
           return x
-        NoUnify{}     -> return x
-        DontKnow err1 -> do
+        NoUnify{}       -> return x
+        UnifyBlocked b1 -> do
           y <- fallback
           case y of
-            DontKnow err2 -> return $ DontKnow $ err1 ++ err2
-            _             -> return y
+            UnifyStuck _    -> return $ UnifyBlocked b1
+            UnifyBlocked b2 -> return $ UnifyBlocked $ unblockOnEither b1 b2
+            _               -> return y
+        UnifyStuck err1 -> do
+          y <- fallback
+          case y of
+            UnifyStuck err2 -> return $ UnifyStuck $ err1 ++ err2
+            _               -> return y
 
-    failure :: UnifyM (UnificationResult' a)
-    failure = return $ DontKnow []
+    failure :: Monad m => m (UnificationResult' a)
+    failure = return $ UnifyStuck []
+
+-- | Turn a term into a pattern while binding as many of the given forced variables as possible (in
+--   non-forced positions).
+patternBindingForcedVars :: PureTCM m => IntMap Modality -> Term -> m (DeBruijnPattern, IntMap Modality)
+patternBindingForcedVars forced v = do
+  let v' = precomputeFreeVars_ v
+  runWriterT (evalStateT (go defaultModality v') forced)
+  where
+    noForced v = gets $ IntSet.disjoint (precomputedFreeVars v) . IntMap.keysSet
+
+    bind md i = do
+      gets (IntMap.lookup i) >>= \case
+        Just md' | related md POLE md' -> do
+          -- The new binding site must be more relevant (more relevant = smaller).
+          -- "The forcing analysis guarantees that there exists such a position."
+          -- Really? Andreas, 2021-08-18, issue #5506
+          tell   $ IntMap.singleton i md
+          modify $ IntMap.delete i
+          return $ varP (deBruijnVar i)
+        _ -> return $ dotP (Var i [])
+
+    go md v = ifM (noForced v) (return $ dotP v) $ do
+      v' <- lift $ lift $ reduce v
+      case v' of
+        Var i [] -> bind md i  -- we know i is forced
+        Con c ci es
+          | Just vs <- allApplyElims es -> do
+            fs <- defForced <$> getConstInfo (conName c)
+            let goArg Forced    v = return $ fmap (unnamed . dotP) v
+                goArg NotForced v = fmap unnamed <$> traverse (go $ composeModality md $ getModality v) v
+            (ps, bound) <- listen $ zipWithM goArg (fs ++ repeat NotForced) vs
+            if IntMap.null bound
+              then return $ dotP v  -- bound nothing
+              else do
+                let cpi = (toConPatternInfo ci) { conPLazy   = True } -- Not setting conPType. Is this a problem?
+                return $ ConP c cpi $ map (setOrigin Inserted) ps
+          | otherwise -> return $ dotP v   -- Higher constructor (es has IApply)
+
+        -- Non-pattern positions
+        Var _ (_:_) -> return $ dotP v
+        Lam{}       -> return $ dotP v
+        Pi{}        -> return $ dotP v
+        Def{}       -> return $ dotP v
+        MetaV{}     -> return $ dotP v
+        Sort{}      -> return $ dotP v
+        Level{}     -> return $ dotP v
+        DontCare{}  -> return $ dotP v
+        Dummy{}     -> return $ dotP v
+        Lit{}       -> __IMPOSSIBLE__

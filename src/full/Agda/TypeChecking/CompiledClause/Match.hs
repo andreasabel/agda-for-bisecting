@@ -1,27 +1,23 @@
-{-# LANGUAGE CPP #-}
 
 module Agda.TypeChecking.CompiledClause.Match where
 
-import Control.Monad.Reader (asks)
-
-import qualified Data.List as List
 import qualified Data.Map as Map
-import qualified Data.Set as Set
+
+import Agda.Interaction.Options (optRewriting)
 
 import Agda.Syntax.Internal
 import Agda.Syntax.Common
 
 import Agda.TypeChecking.CompiledClause
-import Agda.TypeChecking.Monad
-import Agda.TypeChecking.Monad.Builtin (getBuiltinName', builtinIZero, builtinIOne)
-import Agda.TypeChecking.Pretty
+import Agda.TypeChecking.Monad hiding (constructorForm)
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Reduce.Monad as RedM
 import Agda.TypeChecking.Substitute
 
 import Agda.Utils.Maybe
+import Agda.Utils.Monad
+import Agda.Utils.Pretty (prettyShow)
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 matchCompiled :: CompiledClauses -> MaybeReducedArgs -> ReduceM (Reduced (Blocked Args) Term)
@@ -73,7 +69,7 @@ match' ((c, es, patch) : stack) = do
     case c of
 
       -- impossible case
-      Fail -> no (NotBlocked AbsurdMatch) es
+      Fail{} -> no (NotBlocked AbsurdMatch) es
 
       -- done matching
       Done xs t
@@ -130,12 +126,13 @@ match' ((c, es, patch) : stack) = do
                     Just cc -> (cc, es0 ++ es1, patchLit) : stack
                 -- If our argument (or its constructor form) is @Con c ci vs@
                 -- we push @conFrame c vs@ onto the stack.
-                conFrame c ci vs stack =
-                  case Map.lookup (conName c) (conBranches bs) of
+                conFrame c ci vs stack = conFrame' (conName c) (Con c ci) vs stack
+                conFrame' q f vs stack =
+                  case Map.lookup q (conBranches bs) of
                     Nothing -> stack
                     Just cc -> ( content cc
                                , es0 ++ map (MaybeRed NotReduced) vs ++ es1
-                               , patchCon c ci (length vs)
+                               , patchCon f (length vs)
                                ) : stack
                 -- If our argument is @Proj p@, we push @projFrame p@ onto the stack.
                 projFrame p stack =
@@ -148,20 +145,25 @@ match' ((c, es, patch) : stack) = do
                   where (es0, es1) = splitAt n es
                 -- In case we matched constructor @c@ with @m@ arguments,
                 -- contract these @m@ arguments @vs@ to @Con c ci vs@.
-                patchCon c ci m es = patch (es0 ++ [Con c ci vs <$ e] ++ es2)
+--                patchCon c ci m es = patch (es0 ++ [Con c ci vs <$ e] ++ es2)
+                patchCon f m es = patch (es0 ++ [f vs <$ e] ++ es2)
                   where (es0, rest) = splitAt n es
                         (es1, es2)  = splitAt m rest
                         vs          = es1
-            zo <- do
-               mi <- getBuiltinName' builtinIZero
-               mo <- getBuiltinName' builtinIOne
-               return $ Set.fromList $ catMaybes [mi,mo]
+            -- zo <- do
+            --    mi <- getBuiltinName' builtinIZero
+            --    mo <- getBuiltinName' builtinIOne
+            --    return $ Set.fromList $ catMaybes [mi,mo]
 
-            fallThrough <- return $ fromMaybe False (fallThrough bs) && isJust (catchAllBranch bs)
+            fallThrough <- return $ (Just True ==) (fallThrough bs) && isJust (catchAllBranch bs)
 
+            let
+              isCon b =
+                case ignoreBlocking b of
+                 Apply a | c@Con{} <- unArg a -> Just c
+                 _                            -> Nothing
             -- Now do the matching on the @n@ths argument:
-            id $
-             case eb of
+            case eb of
               -- In case of a literal, try also its constructor form
               NotBlocked _ (Apply (Arg info v@(Lit l))) -> performedSimplification $ do
                 cv <- constructorForm v
@@ -170,8 +172,11 @@ match' ((c, es, patch) : stack) = do
                       _        -> stack
                 match' $ litFrame l $ cFrame $ catchAllFrame stack
 
+              NotBlocked _ (Apply (Arg info v@(Def q vs))) | Just{} <- Map.lookup q (conBranches bs) -> performedSimplification $ do
+                match' $ conFrame' q (Def q) vs $ catchAllFrame $ stack
+
               -- In case of a constructor, push the conFrame
-              NotBlocked _ (Apply (Arg info (Con c ci vs))) -> performedSimplification $
+              b | Just (Con c ci vs) <- isCon b -> performedSimplification $
                 match' $ conFrame c ci vs $ catchAllFrame $ stack
 
               -- In case of a projection, push the projFrame
@@ -182,7 +187,6 @@ match' ((c, es, patch) : stack) = do
               _ | fallThrough -> match' $ catchAllFrame $ stack
 
               Blocked x _            -> no (Blocked x) es'
-              NotBlocked _ (Apply (Arg info (MetaV x _))) -> no (Blocked x) es'
 
               -- Otherwise, we are stuck.  If we were stuck before,
               -- we keep the old reason, otherwise we give reason StuckOn here.
@@ -194,8 +198,10 @@ match' [] = {- new line here since __IMPOSSIBLE__ does not like the ' in match' 
   caseMaybeM (asksTC envAppDef) __IMPOSSIBLE__ $ \ f -> do
     pds <- getPartialDefs
     if f `elem` pds
-    then return (NoReduction $ NotBlocked MissingClauses [])
+    then return (NoReduction $ NotBlocked (MissingClauses f) [])
     else do
-      traceSLn "impossible" 10
-        ("Incomplete pattern matching when applying " ++ show f)
+      ifM (optRewriting <$> pragmaOptions)
+      {-then-} (return (NoReduction $ NotBlocked ReallyNotBlocked [])) -- See #5396
+      {-else-} $ traceSLn "impossible" 10
+        ("Incomplete pattern matching when applying " ++ prettyShow f)
         __IMPOSSIBLE__

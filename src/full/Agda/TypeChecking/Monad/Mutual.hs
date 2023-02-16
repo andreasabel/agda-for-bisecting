@@ -1,13 +1,11 @@
--- {-# LANGUAGE CPP #-}
 
 module Agda.TypeChecking.Monad.Mutual where
 
 import Prelude hiding (null)
 
-import Control.Monad.Reader
 
-import Data.Functor ((<$>))
-import Data.Set (Set)
+
+
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 
@@ -16,7 +14,6 @@ import Agda.Syntax.Internal
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Monad.State
 
-import Agda.Utils.Lens
 import Agda.Utils.Null
 import Agda.Utils.Pretty ( prettyShow )
 
@@ -69,14 +66,11 @@ setMutualBlock i x = do
 currentOrFreshMutualBlock :: TCM MutualId
 currentOrFreshMutualBlock = maybe fresh return =<< asksTC envMutualBlock
 
-lookupMutualBlock :: MutualId -> TCM MutualBlock
-lookupMutualBlock mi = do
-  mbs <- useTC stMutualBlocks
-  case Map.lookup mi mbs of
-    Just mb -> return mb
-    Nothing -> return empty -- can end up here if we ask for the current mutual block and there is none
+lookupMutualBlock :: ReadTCState tcm => MutualId -> tcm MutualBlock
+lookupMutualBlock mi = Map.findWithDefault empty mi <$> useTC stMutualBlocks
+   -- can be empty if we ask for the current mutual block and there is none
 
--- | Reverse lookup of a mutual block id for a names.
+-- | Reverse lookup of a mutual block id for a name.
 mutualBlockOf :: QName -> TCM MutualId
 mutualBlockOf x = do
   mb <- Map.toList <$> useTC stMutualBlocks

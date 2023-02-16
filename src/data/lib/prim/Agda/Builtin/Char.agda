@@ -1,10 +1,12 @@
-{-# OPTIONS --without-K #-}
+{-# OPTIONS --cubical-compatible --safe --no-universe-polymorphism
+            --no-sized-types --no-guardedness #-}
 
 module Agda.Builtin.Char where
 
 open import Agda.Builtin.Nat
 open import Agda.Builtin.Bool
 
+postulate Char : Set
 {-# BUILTIN CHAR Char #-}
 
 primitive

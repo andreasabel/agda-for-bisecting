@@ -1,11 +1,14 @@
 
 module Internal.Syntax.Concrete.Name () where
 
+import qualified Data.List as List
+
 import Agda.Syntax.Concrete.Name
+import Agda.Utils.Function ( applyWhen )
+import Agda.Utils.List1    ( (<|) )
+import qualified Agda.Utils.List1 as List1
 
-import Data.List
-
-import Internal.Syntax.Common ()
+import Internal.Helpers
 import Internal.Syntax.Position ()
 
 import Test.QuickCheck
@@ -14,29 +17,23 @@ import Test.QuickCheck
 -- * QuickCheck instances
 ------------------------------------------------------------------------
 
-instance Arbitrary TopLevelModuleName where
-  arbitrary = TopLevelModuleName <$> arbitrary <*> listOf1 (listOf1 $ elements "AB")
-
-instance CoArbitrary TopLevelModuleName where
-  coarbitrary (TopLevelModuleName _ m) = coarbitrary m
-
 instance Arbitrary Name where
   arbitrary = oneof
-    [ Name   <$> arbitrary <*> parts
+    [ Name   <$> arbitrary <*> pure InScope <*> parts
     , NoName <$> arbitrary <*> arbitrary
     ]
     where
     parts = do
-      parts         <- listOf1 (elements ["x", "y", "z"])
+      parts         <- list1Of $ elements ["x", "y", "z"]
       startWithHole <- arbitrary
       endWithHole   <- arbitrary
       return $
-        (if startWithHole then (Hole :)    else id) $
-        (if endWithHole   then (++ [Hole]) else id) $
-        intersperse Hole (map Id parts)
+        applyWhen startWithHole (Hole <|) $
+        applyWhen endWithHole   (`List1.appendList` [Hole]) $
+        List1.intersperse Hole $ fmap Id parts
 
 instance CoArbitrary NamePart
 
 instance CoArbitrary Name where
-  coarbitrary (Name _ ns)  = variant 0 . coarbitrary ns
-  coarbitrary (NoName _ i) = variant 1 . coarbitrary i
+  coarbitrary (Name _ _ ns) = variant 0 . coarbitrary ns
+  coarbitrary (NoName _ i)  = variant 1 . coarbitrary i

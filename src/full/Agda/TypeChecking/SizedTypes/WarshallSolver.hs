@@ -1,15 +1,9 @@
-{-# LANGUAGE CPP                       #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
 
 module Agda.TypeChecking.SizedTypes.WarshallSolver where
 
-#if MIN_VERSION_base(4,11,0)
-import Prelude hiding ( (<>), null, truncate )
-#else
 import Prelude hiding ( null, truncate )
-#endif
 
-import Control.Applicative hiding (Const, empty)
+
 import Control.Monad
 
 import Data.Function (on)
@@ -20,6 +14,8 @@ import qualified Data.Set as Set
 import Data.Map (Map)
 import qualified Data.Map as Map
 
+import Agda.TypeChecking.Pretty (PrettyTCM)
+import qualified Agda.TypeChecking.Pretty as P
 import Agda.TypeChecking.SizedTypes.Syntax
 import Agda.TypeChecking.SizedTypes.Utils
 
@@ -32,7 +28,6 @@ import Agda.Utils.Functor
 import Agda.Utils.Null
 import Agda.Utils.Pretty
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 type Graph r f a = Graph.Graph (Node r f) a
@@ -103,7 +98,7 @@ data Weight
 
 instance Pretty Weight where
   pretty (Offset x) = pretty x
-  pretty Infinity   = text "∞"
+  pretty Infinity   = "∞"
 
 instance Ord Weight where
   x        <= Infinity = True
@@ -200,7 +195,7 @@ instance Ord Label where
 
 instance Pretty Label where
   pretty (Label cmp w) = pretty cmp <> pretty w
-  pretty LInf          = text "∞"
+  pretty LInf          = "∞"
 
 instance MeetSemiLattice Label where
   -- one label is neutral
@@ -242,8 +237,8 @@ data Node rigid flex
   deriving (Show, Eq, Ord)
 
 instance (Pretty rigid, Pretty flex) => Pretty (Node rigid flex) where
-  pretty NodeZero      = text "0"
-  pretty NodeInfty     = text "∞"
+  pretty NodeZero      = "0"
+  pretty NodeInfty     = "∞"
   pretty (NodeRigid x) = pretty x
   pretty (NodeFlex  x) = pretty x
 
@@ -272,9 +267,6 @@ nodeToSizeExpr n =
 -- | An edge is negative if its label is.
 instance Negative a => Negative (Edge' r f a) where
   negative = negative . label
-
--- instance Show a => Show (Edge' a) where
---   show (Edge u v l) = show u ++ " -(" ++ show l ++ ")-> " ++ show v
 
 instance (Ord r, Ord f, MeetSemiLattice a) => MeetSemiLattice (Edge' r f a) where
   e@(Edge u v l) `meet` e'@(Edge u' v' l')
@@ -354,10 +346,10 @@ instance (Ord r, Ord f, Negative a) => Negative (Graphs r f a) where
 implies :: (Ord r, Ord f, Pretty r, Pretty f, Pretty a, Top a, Ord a, Negative a)
   => Graph r f a -> Graph r f a -> Bool
 -- iterate 'test' over all edges in g
-implies h g = and $ map test $ graphToList g
-  -- NB: doing the @test k l@ before the recursive @b@ gives
-  -- opportunity to short-cut the conjunction @&&@.
+implies h g = all test (graphToList g)
   where
+    -- NB: doing the @test k l@ before the recursive @b@ gives
+    -- opportunity to short-cut the conjunction @&&@.
     -- test :: Key -> a -> Bool
     test k@(Edge src dest l)
       | isZeroNode src, not (negative l) = True
@@ -367,9 +359,15 @@ implies h g = and $ map test $ graphToList g
       | isTop l                          = True
       | otherwise = case lookupEdge h src dest of
         Nothing -> False
-        Just l' -> if l' <= l then True else
-          trace ("edge " ++ prettyShow (l <$ k) ++ " not implied by " ++ prettyShow (l' <$ k)) $
-            False
+        Just l' ->
+          (l' <= l) || ( trace
+                           ( "edge " ++ prettyShow (l <$ k)
+                               ++ " not implied by "
+                               ++ prettyShow (l' <$ k)
+                           )
+                           $ False
+                       )
+
 -- implies h g = Map.foldlWithKey (\ b k l -> test k l && b) True g
 --   -- NB: doing the @test k l@ before the recursive @b@ gives
 --   -- opportunity to short-cut the conjunction @&&@.
@@ -388,7 +386,7 @@ implies h g = and $ map test $ graphToList g
 --             False
 
 nodeFromSizeExpr :: SizeExpr' rigid flex -> (Node rigid flex, Offset)
-nodeFromSizeExpr e = case e of
+nodeFromSizeExpr = \case
   Const   n -> (NodeZero   , n)
   Rigid i n -> (NodeRigid i, n)
   Flex  x n -> (NodeFlex x , n)
@@ -432,7 +430,7 @@ type Hyp' = Constraint'
 type HypGraph r f = Graph r f Label
 
 hypGraph :: (Ord rigid, Ord flex, Pretty rigid, Pretty flex) =>
-  Set rigid -> [Hyp' rigid flex] -> Either String (HypGraph rigid flex)
+  Set rigid -> [Hyp' rigid flex] -> Either Error (HypGraph rigid flex)
 hypGraph is hyps0 = do
   -- get a list of hypothesis from a list of constraints
   hyps <- concat <$> mapM (simplify1 $ \ c -> return [c]) hyps0
@@ -450,8 +448,10 @@ hypConn hg n1 n2
   | Just l <- lookupEdge hg n1 n2 = l
   | otherwise                               = top
 
-simplifyWithHypotheses :: (Ord rigid, Ord flex, Pretty rigid, Pretty flex) =>
-  HypGraph rigid flex -> [Constraint' rigid flex] -> Either String [Constraint' rigid flex]
+simplifyWithHypotheses ::
+  (Ord rigid, Ord flex, Pretty rigid, Pretty flex) =>
+  HypGraph rigid flex -> [Constraint' rigid flex] ->
+  Either Error [Constraint' rigid flex]
 simplifyWithHypotheses hg cons = concat <$> mapM (simplify1 test) cons
   where
     -- Test whether a constraint is compatible with the hypotheses:
@@ -462,7 +462,8 @@ simplifyWithHypotheses hg cons = concat <$> mapM (simplify1 test) cons
           l' = hypConn hg n1 n2
       -- l' <- lookupEdge hg n1 n2
       unless (l' <= l) $ Left $
-        "size constraint " ++ prettyShow c ++ " not consistent with size hypotheses"
+        "size constraint" P.<+> P.pretty c P.<+>
+        "not consistent with size hypotheses"
       return [c]
       -- if (l' <= l) then Just [c] else Nothing
 
@@ -471,7 +472,9 @@ simplifyWithHypotheses hg cons = concat <$> mapM (simplify1 test) cons
 
 type ConGraph r f = Graph r f Label
 
-constraintGraph :: (Ord r, Ord f, Pretty r, Pretty f) => [Constraint' r f] -> HypGraph r f -> Either String (ConGraph r f)
+constraintGraph ::
+  (Ord r, Ord f, Pretty r, Pretty f) =>
+  [Constraint' r f] -> HypGraph r f -> Either Error (ConGraph r f)
 constraintGraph cons0 hg = do
   traceM $ "original constraints cons0 = " ++ prettyShow cons0
   -- Simplify constraints, ensure they are locally consistent with
@@ -491,7 +494,9 @@ constraintGraph cons0 hg = do
 
 type ConGraphs r f = Graphs r f Label
 
-constraintGraphs :: (Ord r, Ord f, Pretty r, Pretty f) => [Constraint' r f] -> HypGraph r f -> Either String ([f], ConGraphs r f)
+constraintGraphs ::
+  (Ord r, Ord f, Pretty r, Pretty f) =>
+  [Constraint' r f] -> HypGraph r f -> Either Error ([f], ConGraphs r f)
 constraintGraphs cons0 hg = do
   traceM $ "original constraints cons0 = " ++ prettyShow cons0
   -- Simplify constraints, ensure they are locally consistent with
@@ -657,7 +662,8 @@ commonSuccs :: (Ord r, Ord f) =>
                Graph r f a -> [Node r f] -> Map (Node r f) [Edge' r f a]
 commonSuccs hg srcs = intersectAll $ map (buildmap . outgoing hg) srcs
   where
-   buildmap            = Map.fromList . map (\ e -> (dest e, [e]))
+   buildmap            = Map.fromListWith __IMPOSSIBLE__ . map (\ e -> (dest e, [e]))
+     -- __IMPOSSIBLE__ because it is not a multi-graph; there is at most one egde per (src,dest)
    intersectAll []     = Map.empty
    intersectAll (m:ms) = foldl (Map.intersectionWith (++)) m ms
 
@@ -669,7 +675,7 @@ commonSuccs hg srcs = intersectAll $ map (buildmap . outgoing hg) srcs
 commonPreds :: (Ord r, Ord f) => Graph r f a -> [Node r f] -> Map (Node r f) [Edge' r f a]
 commonPreds hg tgts = intersectAll $  map (buildmap . incoming hg) tgts
   where
-   buildmap = Map.fromList . map (\ e -> (src e, [e]))
+   buildmap = Map.fromListWith __IMPOSSIBLE__ . map (\ e -> (src e, [e]))
    intersectAll []     = Map.empty
    intersectAll (m:ms) = foldl (Map.intersectionWith (++)) m ms
 
@@ -861,18 +867,18 @@ findRigidBelow hg e = __IMPOSSIBLE__
 
 
 solveGraph
-  :: (Ord r, Ord f, Pretty r, Pretty f, Show r, Show f)
+  :: (Ord r, Ord f, Pretty r, Pretty f, PrettyTCM f, Show r, Show f)
   => Polarities f
   -> HypGraph r f
   -> ConGraph r f
-  -> Either String (Solution r f)
+  -> Either Error (Solution r f)
 solveGraph pols hg g = do
   let (Bounds lbs ubs fs) = bounds g
       -- flexibles to solve for
       xs = Set.toAscList $ Set.unions [ Map.keysSet lbs, Map.keysSet ubs, fs ]
   -- iterate over all flexible variables
   xas <- catMaybes <$> do
-    forM xs $ \ x -> do
+    forM xs $ \ x -> fmap (x,) <$> do
       -- get lower and upper bounds for flexible x
       let lx = Set.toList $ Map.findWithDefault Set.empty x lbs
           ux = Set.toList $ Map.findWithDefault Set.empty x ubs
@@ -884,8 +890,9 @@ solveGraph pols hg g = do
           []     -> return $ Nothing
           (a:as) -> do
             case foldM (lub hg) a as of
-              Nothing -> Left $ "inconsistent lower bound for " ++ prettyShow x
               Just l  -> return $ Just $ truncateOffset l
+              Nothing -> Left $
+                "inconsistent lower bound for" P.<+> P.prettyTCM x
       -- compute minimum of upper bounds
       ub <- do
         case ux of
@@ -894,27 +901,28 @@ solveGraph pols hg g = do
             case foldM (glb hg) a as of
               Just l | validOffset l                  -> return $ Just l
                      | Just l' <- findRigidBelow hg l -> return $ Just l'
-              _ -> Left $ "inconsistent upper bound for " ++ prettyShow x
+              _ -> Left $
+                "inconsistent upper bound for" P.<+> P.prettyTCM x
       case (lb, ub) of
-        (Just l, Nothing) -> return $ Just (x, l)  -- solve x = lower bound
-        (Nothing, Just u) -> return $ Just (x, u)  -- solve x = upper bound
+        (Just l, Nothing) -> return $ Just l  -- solve x = lower bound
+        (Nothing, Just u) -> return $ Just u  -- solve x = upper bound
         (Just l,  Just u) -> do
           traceM ("lower bound for " ++ prettyShow x ++ ": " ++ prettyShow l)
           traceM ("upper bound for " ++ prettyShow x ++ ": " ++ prettyShow u)
           case getPolarity pols x of
-            Least    -> return $ Just (x, l)
-            Greatest -> return $ Just (x, u)
+            Least    -> return $ Just l
+            Greatest -> return $ Just u
         _ -> return Nothing
-  return $ Solution $ Map.fromList xas
+  return $ Solution $ Map.fromDistinctAscList xas
 
 -- | Solve a forest of constraint graphs relative to a hypotheses graph.
 --   Concatenate individual solutions.
 solveGraphs
-  :: (Ord r, Ord f, Pretty r, Pretty f, Show r, Show f)
+  :: (Ord r, Ord f, Pretty r, Pretty f, PrettyTCM f, Show r, Show f)
   => Polarities f
   -> HypGraph r f
   -> ConGraphs r f
-  -> Either String (Solution r f)
+  -> Either Error (Solution r f)
 solveGraphs pols hg gs =
   Solution . Map.unions <$> mapM (theSolution <.> solveGraph pols hg) gs
 
@@ -927,7 +935,7 @@ verifySolution
   => HypGraph r f
   -> [Constraint' r f]
   -> Solution r f
-  -> Either String ()
+  -> Either Error ()
 verifySolution hg cs sol = do
   cs <- return $ subst sol cs
   traceM $ "substituted constraints " ++ prettyShow cs
@@ -952,7 +960,7 @@ verifySolution hg cs sol = do
 --   which would otherwise go unnoticed.
 
 iterateSolver
-  :: (Ord r, Ord f, Pretty r, Pretty f, Show r, Show f)
+  :: (Ord r, Ord f, Pretty r, Pretty f, PrettyTCM f, Show r, Show f)
   => Polarities f
      -- ^ Meta variable polarities (prefer lower or upper solution?).
   -> HypGraph r f
@@ -961,7 +969,7 @@ iterateSolver
      -- ^ Constraints to solve.
   -> Solution r f
      -- ^ Previous substitution (already applied to constraints).
-  -> Either String (Solution r f)
+  -> Either Error (Solution r f)
      -- ^ Accumulated substition.
 
 iterateSolver pols hg cs sol0 = do

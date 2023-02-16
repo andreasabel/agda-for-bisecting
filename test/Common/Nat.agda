@@ -1,3 +1,4 @@
+{-# OPTIONS --cubical-compatible #-}
 module Common.Nat where
 
 open import Agda.Builtin.Nat public

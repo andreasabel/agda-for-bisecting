@@ -7,6 +7,8 @@ Getting Started
 .. toctree::
    :maxdepth: 2
 
-   prerequisites
+   what-is-agda
    installation
-   quick-guide
+   hello-world
+   a-taste-of-agda
+   tutorial-list

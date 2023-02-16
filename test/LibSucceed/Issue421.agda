@@ -9,7 +9,7 @@ open import Data.Nat using (ℕ;zero;suc)
 open import Data.Fin using (Fin;zero;suc)
 open import Data.Vec
 open import Data.Empty
-open import Data.Product
+open import Data.Product hiding (_<*>_)
 open import Data.Sum
 open import Data.Unit
 
@@ -25,9 +25,11 @@ module Matrices {Ix : Set} {Σ : (Ix -> Set) -> Set} where
 
   _<+>_ : Matrix -> Matrix -> Matrix
   m <+> n = λ i j -> m i j ⊎ n i j
+  {-# INLINE _<+>_ #-}
 
   _<*>_ : Matrix -> Matrix -> Matrix
   m <*> n = λ i j -> Σ λ k -> m i k × n k j
+  {-# INLINE _<*>_ #-}
 
 data Poly {Coeffs : Set1} : Set1 where
   0p 1p : Poly
@@ -44,7 +46,7 @@ module Dim {n : ℕ} where
   ⟦ X ⟧ x i j = x i j
   ⟦ D1 + D2 ⟧ x i j = (⟦ D1 ⟧ x <+> ⟦ D2 ⟧ x) i j
   ⟦ D1 * D2 ⟧ x i j = (⟦ D1 ⟧ x <*> ⟦ D2 ⟧ x) i j
-  ⟦ K S ⟧ x i j = lookup j (lookup i S)
+  ⟦ K S ⟧ x i j = lookup (lookup S i) j
 
   ⟪_⟫ : Poly {Set} -> Set → Set
   ⟪ 0p ⟫ x = ⊥

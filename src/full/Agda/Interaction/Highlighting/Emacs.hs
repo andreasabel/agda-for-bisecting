@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 
 -- | Functions which give precise syntax highlighting info to Emacs.
 
@@ -6,6 +5,8 @@ module Agda.Interaction.Highlighting.Emacs
   ( lispifyHighlightingInfo
   , lispifyTokenBased
   ) where
+
+import Prelude hiding (null)
 
 import Agda.Interaction.Highlighting.Common
 import Agda.Interaction.Highlighting.Precise
@@ -15,12 +16,14 @@ import Agda.Interaction.Response
 import Agda.TypeChecking.Monad (HighlightingMethod(..), ModuleToSource)
 import Agda.Utils.FileName (filePath)
 import Agda.Utils.IO.TempFile (writeToTempFile)
+import Agda.Utils.Pretty (prettyShow)
 import Agda.Utils.String (quote)
 
+import qualified Data.List as List
 import qualified Data.Map as Map
 import Data.Maybe
 
-#include "undefined.h"
+import Agda.Utils.Null
 import Agda.Utils.Impossible
 
 ------------------------------------------------------------------------
@@ -41,18 +44,15 @@ showAspects modFile (r, m) = L $
     dropNils (
       [lispifyTokenBased (tokenBased m)]
         ++
-      [A $ maybe "nil" quote $ note m]
+      [A $ ifNull (note m) "nil" quote]
         ++
-      (maybeToList $ fmap defSite $ definitionSite m))
+      maybeToList (defSite <$> definitionSite m))
   where
   defSite (DefinitionSite m p _ _) =
     Cons (A $ quote $ filePath f) (A $ show p)
     where f = Map.findWithDefault __IMPOSSIBLE__ m modFile
 
-  dropNils =
-    reverse .
-    dropWhile (== A "nil") .
-    reverse
+  dropNils = List.dropWhileEnd (== A "nil")
 
 -- | Formats the 'TokenBased' tag for the Emacs backend. No quotes are
 -- added.
@@ -85,7 +85,7 @@ lispifyHighlightingInfo h remove method modFile =
   info = (case remove of
                 RemoveHighlighting -> A "remove"
                 KeepHighlighting   -> A "nil") :
-             map (showAspects modFile) (ranges h)
+             map (showAspects modFile) (toList h)
 
   direct :: IO (Lisp String)
   direct = return $ L (A "agda2-highlight-add-annotations" :
@@ -93,7 +93,7 @@ lispifyHighlightingInfo h remove method modFile =
 
   indirect :: IO (Lisp String)
   indirect = do
-    filepath <- writeToTempFile (show $ L info)
+    filepath <- writeToTempFile (prettyShow $ L info)
     return $ L [ A "agda2-highlight-load-and-delete-action"
                , A (quote filepath)
                ]

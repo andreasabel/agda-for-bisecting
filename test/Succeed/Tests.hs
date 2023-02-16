@@ -1,20 +1,24 @@
 {-# LANGUAGE DoAndIfThenElse   #-}
-{-# LANGUAGE OverloadedStrings #-}
 
 module Succeed.Tests where
 
-import Test.Tasty
-import Test.Tasty.Silver
-import Test.Tasty.Silver.Advanced (readFileMaybe, goldenTestIO1, GDiff (..), GShow (..))
-import System.FilePath
-import System.IO.Temp
+import qualified Data.List as List
+import Data.Maybe (isJust, fromMaybe)
+import Data.Monoid ((<>))
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Data.Text.Encoding
-import Data.Monoid ((<>))
-import System.Exit
-import Data.List
+
+import Test.Tasty
+import Test.Tasty.Silver
+import Test.Tasty.Silver.Advanced
+  (readFileMaybe, goldenTestIO1, GDiff (..), GShow (..))
+import Test.Tasty.Silver.Filter ( RegexFilter( RFInclude ) )
+
 import System.Directory
+import System.Exit
+import System.FilePath
+import System.IO.Temp
 
 import Utils
 
@@ -23,103 +27,113 @@ testDir = "test" </> "Succeed"
 
 tests :: IO TestTree
 tests = do
-  inpFiles <- getAgdaFilesInDir Rec testDir
+  inpFiles <- reorder <$> getAgdaFilesInDir Rec testDir
 
   let extraOpts = [ "--ignore-interfaces" , "--vim" ]
   let tests' = map (mkSucceedTest extraOpts testDir) inpFiles
 
   return $ testGroup "Succeed" tests'
+  where
+  reorder = id
+  -- -- Andreas, 2020-10-19, work around issue #4940:
+  -- -- Put @ExecAgda@ last.
+  -- reorder = uncurry (++) . List.partition (not . ("ExecAgda" `List.isInfixOf`))
 
-data AgdaResult
-  = AgdaSuccess
-  | AgdaSuccessWithWarnings T.Text -- the cleaned stdout
-  | AgdaUnexpectedFail ProgramResult
-  | AgdaWrongDotOutput T.Text
+-- | Tests that get special preparation from the Makefile.
+makefileDependentTests :: [RegexFilter]
+makefileDependentTests =
+  [ disable "Succeed/ExecAgda"
+  , disable "Succeed/Issue4967"
+      -- Andreas, 2022-03-26, issue #5619
+      -- Test #4967 is not actually "Makefile-dependent",
+      -- but it has race conditions in github/workflows/cabal-test
+      -- so we disable it in this test suite.
+  ]
+  where disable = RFInclude
+
+data TestResult
+  = TestSuccess
+  | TestSuccessWithWarnings T.Text -- the cleaned stdout
+  | TestUnexpectedFail ProgramResult
+  | TestWrongDotOutput T.Text
 
 mkSucceedTest
-  :: [String] -- ^ Extra options to Agda.
+  :: AgdaArgs -- ^ Extra options to Agda.
   -> FilePath -- ^ Test directory.
-  -> FilePath -- ^ Input file.
+  -> FilePath -- ^ Input file (an Agda file).
   -> TestTree
-mkSucceedTest extraOpts dir inp =
-  goldenTestIO1 testName readGolden (printAgdaResult <$> doRun) resDiff resShow updGolden
---  goldenVsAction testName goldenFile doRun printAgdaResult
-  where testName = asTestName dir inp
-        flagFile = dropAgdaExtension inp <.> ".flags"
-        warnFile = dropAgdaExtension inp <.> ".warn"
+mkSucceedTest extraOpts dir agdaFile =
+  goldenTestIO1
+    testName
+    readGolden
+    (printTestResult <$> doRun)
+    (textDiffWithTouch agdaFile)
+    (return . ShowText)
+    updGolden
+  where
+  testName = asTestName dir agdaFile
+  baseName = dropAgdaExtension agdaFile
+  varFile  = baseName <.> ".vars"
+  flagFile = baseName <.> ".flags"
+  warnFile = baseName <.> ".warn"
 
-        -- Unless we have a .warn file, we don't really have a golden
-        -- file. Just use a dummy update function.
-        -- TODO extend tasty-silver to handle this use case properly
-        readGolden = do
-          warnExists <- doesFileExist warnFile
-          if warnExists then readTextFileMaybe warnFile
-                        else return $ Just $ printAgdaResult AgdaSuccess
+  -- Unless we have a .warn file, we don't really have a golden
+  -- file. Just use a dummy update function.
+  -- TODO extend tasty-silver to handle this use case properly
+  readGolden = do
+    warnExists <- doesFileExist warnFile
+    if warnExists then readTextFileMaybe warnFile
+                  else return $ Just $ printTestResult TestSuccess
 
-        updGolden = Just $ writeTextFile warnFile
+  updGolden = Just $ writeTextFile warnFile
 
-        doRun = do
-          flags <- maybe [] (T.unpack . decodeUtf8) <$> readFileMaybe flagFile
-          let agdaArgs = [ "-v0", "-i" ++ dir, "-itest/" , inp
-                         , "--no-libraries"
-                         , "-vimpossible:10" -- BEWARE: no spaces allowed here
-                         , "-vwarning:1"
-                         ] ++
-                         extraOpts ++ words flags
-          let run = \extraArgs -> readAgdaProcessWithExitCode (agdaArgs ++ extraArgs) T.empty
+  doRun = do
 
-          res@(ret, stdOut, _) <-
-            if "--compile" `isInfixOf` flags
-              then
-                -- Andreas, 2017-04-14, issue #2317
-                -- Create temporary files in system temp directory.
-                -- This has the advantage that upon Ctrl-C no junk is left behind
-                -- in the Agda directory.
-                -- withTempDirectory dir ("MAZ_compile_" ++ testName) (\compDir ->
-                withSystemTempDirectory ("MAZ_compile_" ++ testName) (\compDir ->
-                  run ["--compile-dir=" ++ compDir]
-                  )
-              else
-                run []
+    let agdaArgs = [ "-v0", "-i" ++ dir, "-itest/", agdaFile
+                   , "-vimpossible:10" -- BEWARE: no spaces allowed here
+                   , "-vwarning:1"
+                   , "--double-check"
+                   ] ++
+                   [ if testName == "Issue481"
+                     then "--no-default-libraries"
+                     else "--no-libraries"
+                   ] ++
+                   extraOpts
 
-          case ret of
-            ExitSuccess | testName == "Issue481" -> do
-              dotOrig <- TIO.readFile (dir </> "Issue481.dot.orig")
-              dot <- TIO.readFile "Issue481.dot"
-              removeFile "Issue481.dot"
-              if dot == dotOrig
-                then
-                  return $ AgdaSuccess
-                else
-                  return $ AgdaWrongDotOutput dot
-            ExitSuccess -> do
-              cleanedStdOut <- cleanOutput stdOut
-              warnExists    <- doesFileExist warnFile
-              return $
-                if warnExists || hasWarning cleanedStdOut
-                then AgdaSuccessWithWarnings cleanedStdOut
-                else AgdaSuccess
-            _ -> return $ AgdaUnexpectedFail res
+    (res, ret) <- runAgdaWithOptions testName agdaArgs (Just flagFile) (Just varFile)
 
-hasWarning :: T.Text -> Bool
-hasWarning t =
- "———— All done; warnings encountered ————————————————————————"
- `T.isInfixOf` t
+    case ret of
+      AgdaSuccess{} | testName == "Issue481" -> do
+        dotOrig <- TIO.readFile (dir </> "Issue481.dot.orig")
+        dot <- TIO.readFile "Issue481.dot"
+        removeFile "Issue481.dot"
+        if dot == dotOrig
+          then
+            return $ TestSuccess
+          else
+            return $ TestWrongDotOutput dot
+      AgdaSuccess warn -> do
+        warnExists <- doesFileExist warnFile
+        return $
+          if warnExists || isJust warn
+          then TestSuccessWithWarnings $ stdOut res -- TODO: distinguish log vs. warn?
+          else TestSuccess
+      AgdaFailure{} -> return $ TestUnexpectedFail res
 
-resDiff :: T.Text -> T.Text -> IO GDiff
-resDiff t1 t2 =
-  if t1 == t2
-    then
-      return Equal
-    else
-      return $ DiffText Nothing t1 t2
+printTestResult :: TestResult -> T.Text
+printTestResult = \case
+  TestSuccess               -> "AGDA_SUCCESS\n\n"
+  TestSuccessWithWarnings t -> t
+  TestUnexpectedFail p      -> "AGDA_UNEXPECTED_FAIL\n\n" <> printProgramResult p
+  TestWrongDotOutput t      -> "AGDA_WRONG_DOT_OUTPUT\n\n" <> t
 
-resShow :: T.Text -> IO GShow
-resShow = return . ShowText
-
-printAgdaResult :: AgdaResult -> T.Text
-printAgdaResult r = case r of
-  AgdaSuccess               -> "AGDA_SUCCESS\n\n"
-  AgdaSuccessWithWarnings t -> t
-  AgdaUnexpectedFail p      -> "AGDA_UNEXPECTED_FAIL\n\n" <> printProcResult p
-  AgdaWrongDotOutput t      -> "AGDA_WRONG_DOT_OUTPUT\n\n" <> t
+-- WAS: List of test cases that do not pass the --double-check yet
+-- NOTE
+--  Why are a lot of the sized types tests not working with --double-check? The reason can be found
+--  in Agda.TypeChecking.MetaVars.blockTermOnProblem, which does not block a term on unsolved size
+--  constraints (introduced by @andreasabel in 3be79cc7fd). This might be safe to do, but it will
+--  not be accepted by a double check.
+--
+-- Andreas, 2021-04-29, issue #5352
+-- Now, there is an option `--no-double-check` in the respective .flags file.
+-- To get the list, try:  grep no-double-check *.flags

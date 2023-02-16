@@ -1,14 +1,11 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE PolyKinds #-}
+
 module MAlonzo.RTE where
 
 import Unsafe.Coerce
-#if __GLASGOW_HASKELL__ >= 802
 import qualified GHC.Exts as GHC (Any)
-#else
-import qualified GHC.Prim as GHC (Any)
-#endif
+import Data.Char
 import qualified Data.Word
-import Numeric.IEEE ( IEEE(identicalIEEE) )
 
 type AgdaAny = GHC.Any
 
@@ -22,8 +19,9 @@ coe = unsafeCoerce
 data QName = QName { nameId, moduleId :: Integer, qnameString :: String, qnameFixity :: Fixity }
 
 data Assoc      = NonAssoc | LeftAssoc | RightAssoc
-data Precedence = Unrelated | Related Integer
+data Precedence = Unrelated | Related PrecedenceLevel
 data Fixity     = Fixity Assoc Precedence
+type PrecedenceLevel = Double
 
 instance Eq QName where
   QName a b _ _ == QName c d _ _ = (a, b) == (c, d)
@@ -34,11 +32,11 @@ instance Ord QName where
 erased :: a
 erased = coe (\ _ -> erased)
 
-mazIncompleteMatch :: String -> a
-mazIncompleteMatch s = error ("Agda: incomplete pattern matching: " ++ s)
-
 mazUnreachableError :: a
 mazUnreachableError = error ("Agda: unreachable code reached.")
+
+mazHole :: String -> a
+mazHole s = error ("Agda: reached hole: " ++ s)
 
 addInt :: Integer -> Integer -> Integer
 addInt = (+)
@@ -64,48 +62,12 @@ quotInt = quot
 remInt :: Integer -> Integer -> Integer
 remInt = rem
 
-eqFloat :: Double -> Double -> Bool
-eqFloat x y = identicalIEEE x y || (isNaN x && isNaN y)
-
-eqNumFloat :: Double -> Double -> Bool
-eqNumFloat = (==)
-
-ltNumFloat :: Double -> Double -> Bool
-ltNumFloat = (<)
-
-negativeZero :: Double
-negativeZero = -0.0
-
-positiveInfinity :: Double
-positiveInfinity = 1.0 / 0.0
-
-negativeInfinity :: Double
-negativeInfinity = -positiveInfinity
-
-positiveNaN :: Double
-positiveNaN = 0.0 / 0.0
-
-negativeNaN :: Double
-negativeNaN = -positiveNaN
-
--- Adapted from the same function on Agda.Syntax.Literal.
-compareFloat :: Double -> Double -> Ordering
-compareFloat x y
-  | identicalIEEE x y          = EQ
-  | isNegInf x                 = LT
-  | isNegInf y                 = GT
-  | isNaN x && isNaN y         = EQ
-  | isNaN x                    = LT
-  | isNaN y                    = GT
-  | otherwise                  = compare (x, isNegZero y) (y, isNegZero x)
-  where
-    isNegInf  z = z < 0 && isInfinite z
-    isNegZero z = identicalIEEE z negativeZero
-
-ltFloat :: Double -> Double -> Bool
-ltFloat x y = case compareFloat x y of
-                LT -> True
-                _  -> False
+-- #4999: Data.Text maps surrogate code points (\xD800 - \xDFFF) to the replacement character
+-- \xFFFD, so to keep strings isomorphic to list of characters we do the same for characters.
+natToChar :: Integer -> Char
+natToChar n | generalCategory c == Surrogate = '\xFFFD'
+            | otherwise                      = c
+  where c = toEnum $ fromIntegral $ mod n 0x110000
 
 -- Words --
 
@@ -147,5 +109,5 @@ lt64 = (<)
 
 -- Support for musical coinduction.
 
-data Inf a            = Sharp { flat :: a }
-type Infinity level a = Inf a
+data Inf                   a = Sharp { flat :: a }
+type Infinity (level :: *) a = Inf a

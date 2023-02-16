@@ -1,3 +1,4 @@
+{-# OPTIONS --cubical-compatible #-}
 module Common.IO where
 
 open import Agda.Builtin.IO public

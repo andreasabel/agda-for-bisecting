@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 
 {-| Split tree for transforming pattern clauses into case trees.
 
@@ -13,19 +12,21 @@ each leaf of the split tree.
 -}
 module Agda.TypeChecking.Coverage.SplitTree where
 
+import Control.DeepSeq
+
 import Data.Tree
+
+import GHC.Generics (Generic)
 
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Common
-import Agda.Syntax.Internal as I
+import Agda.Syntax.Concrete.Pretty () --instance only
 import Agda.Syntax.Literal
+import Agda.Syntax.Position
 
-import Agda.TypeChecking.Pretty ( PrettyTCM(..) )
-
-import Agda.Utils.Monad
 import Agda.Utils.Pretty
+import Agda.Utils.Null
 
-#include "undefined.h"
 import Agda.Utils.Impossible
 
 type SplitTree  = SplitTree'  SplitTag
@@ -41,8 +42,13 @@ data SplitTree' a
   | -- | A split is necessary.
     SplitAt
     { splitArg   :: Arg Int       -- ^ Arg. no to split at.
+    , splitLazy  :: LazySplit
     , splitTrees :: SplitTrees' a -- ^ Sub split trees.
     }
+  deriving (Show, Generic)
+
+data LazySplit = LazySplit | StrictSplit
+  deriving (Show, Eq, Ord, Generic)
 
 -- | Split tree branching.  A finite map from constructor names to splittrees
 --   A list representation seems appropriate, since we are expecting not
@@ -57,38 +63,36 @@ data SplitTag
   = SplitCon QName
   | SplitLit Literal
   | SplitCatchall
-  deriving (Show, Eq, Ord)
+  deriving (Show, Eq, Ord, Generic)
 
 instance Pretty SplitTag where
-  pretty (SplitCon c)  = pretty c
+  pretty (SplitCon c) = pretty c
   pretty (SplitLit l)  = pretty l
   pretty SplitCatchall = underscore
-
-instance PrettyTCM SplitTag where
-  prettyTCM (SplitCon c)  = prettyTCM c
-  prettyTCM (SplitLit l)  = prettyTCM l
-  prettyTCM SplitCatchall = return underscore
 
 -- * Printing a split tree
 
 data SplitTreeLabel a = SplitTreeLabel
   { lblConstructorName :: Maybe a   -- ^ 'Nothing' for root of split tree
   , lblSplitArg        :: Maybe (Arg Int)
+  , lblLazy            :: LazySplit
   , lblBindings        :: Maybe Int
   }
 instance Pretty a => Pretty (SplitTreeLabel a) where
   pretty = \case
-    SplitTreeLabel Nothing Nothing (Just n)  -> text $ "done, " ++ show n ++ " bindings"
-    SplitTreeLabel Nothing (Just n) Nothing  -> text $ "split at " ++ show n
-    SplitTreeLabel (Just q) Nothing (Just n) -> pretty q <+> text (" -> done, " ++ show n ++ " bindings")
-    SplitTreeLabel (Just q) (Just n) Nothing -> pretty q <+> text (" -> split at " ++ show n)
+    SplitTreeLabel Nothing Nothing   _  (Just n) -> text $ "done, " ++ prettyShow n ++ " bindings"
+    SplitTreeLabel Nothing (Just n)  lz Nothing  -> lzp lz <+> text ("split at " ++ prettyShow n)
+    SplitTreeLabel (Just q) Nothing  _  (Just n) -> pretty q <+> text ("-> done, " ++ prettyShow n ++ " bindings")
+    SplitTreeLabel (Just q) (Just n) lz Nothing  -> pretty q <+> text "->" <+> lzp lz <+> text ("split at " ++ prettyShow n)
     _ -> __IMPOSSIBLE__
+    where lzp lz | lz == LazySplit = "lazy"
+                 | otherwise       = empty
 
 -- | Convert a split tree into a 'Data.Tree' (for printing).
 toTree :: SplitTree' a -> Tree (SplitTreeLabel a)
-toTree t = case t of
-  SplittingDone n -> Node (SplitTreeLabel Nothing Nothing (Just n)) []
-  SplitAt n ts    -> Node (SplitTreeLabel Nothing (Just n) Nothing) $ toTrees ts
+toTree = \case
+  SplittingDone n -> Node (SplitTreeLabel Nothing Nothing StrictSplit (Just n)) []
+  SplitAt n lz ts    -> Node (SplitTreeLabel Nothing (Just n) lz Nothing) $ toTrees ts
 
 toTrees :: SplitTrees' a -> Forest (SplitTreeLabel a)
 toTrees = map (\ (c,t) -> setCons c $ toTree t)
@@ -98,3 +102,18 @@ toTrees = map (\ (c,t) -> setCons c $ toTree t)
 
 instance Pretty a => Pretty (SplitTree' a) where
   pretty = text . drawTree . fmap prettyShow . toTree
+
+instance KillRange SplitTag where
+  killRange = \case
+    SplitCon c -> killRange1 SplitCon c
+    SplitLit l -> killRange1 SplitLit l
+    SplitCatchall -> SplitCatchall
+
+instance KillRange a => KillRange (SplitTree' a) where
+  killRange = \case
+    SplittingDone n -> SplittingDone n
+    SplitAt i lz ts -> killRange1 (SplitAt i lz) ts
+
+instance NFData a => NFData (SplitTree' a)
+instance NFData LazySplit
+instance NFData SplitTag

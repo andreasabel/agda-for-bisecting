@@ -1,13 +1,22 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE CPP             #-}
 
+#if  __GLASGOW_HASKELL__ > 800
+{-# OPTIONS_GHC -Wno-error=missing-signatures #-}
+#endif
 {-# OPTIONS_GHC -fno-warn-missing-signatures #-}
 
 module Internal.Utils.List ( tests ) where
 
 import Agda.Utils.List
 
+import Data.Bifunctor (first)
+import Data.Either (partitionEithers)
 import Data.Function
 import Data.List
+  ((\\), elemIndex, intercalate, isPrefixOf, isSuffixOf,
+   minimumBy, nub, nubBy, sort, sortBy)
+import qualified Data.List as List
 
 import Internal.Helpers
 
@@ -17,6 +26,8 @@ prop_last2 a b as = last2 (a:b:as) == toPair (drop (length as) $ a:b:as)
   where
   toPair [x,y] = Just (x,y)
   toPair _     = Nothing
+
+prop_dropEnd n as = dropEnd n as == reverse (drop n (reverse as))
 
 -- Trivial:
 -- prop_initLast_nil       = initLast [] == Nothing
@@ -33,8 +44,26 @@ prop_updateLast f as = updateLast f as == spec_updateLast f as
 spec_updateAt n f as = let (bs, cs) = splitAt n as in bs ++ updateHead f cs
 prop_updateAt (NonNegative n) f as = updateAt n f as == spec_updateAt n f as
 
+prop_spanEnd_split   p xs = let (ys, zs) = spanEnd p xs in xs == ys ++ zs
+prop_spanEnd_holds   p xs = let (ys, zs) = spanEnd p xs in all p zs
+prop_spanEnd_maximal p xs = let (ys, zs) = spanEnd p xs in maybe True (not . p) (lastMaybe ys)
+
+prop_partitionMaybe :: (Int -> Maybe Bool) -> [Int] -> Bool
+prop_partitionMaybe f as = partitionMaybe f as == partitionEithers (map f' as)
+  where f' a = maybe (Left a) Right $ f a
+
 prop_mapMaybeAndRest_Nothing as = mapMaybeAndRest (const Nothing) as == ([] :: [Int],as)
 prop_mapMaybeAndRest_Just    as = mapMaybeAndRest Just            as == (as,[])
+
+prop_stripSuffix_sound    suf xs  = maybe True (\ pre -> xs == pre ++ suf) $ stripSuffix suf xs
+prop_stripSuffix_complete pre suf = stripSuffix suf (pre ++ suf) == Just pre
+
+prop_stripReversedSuffix_sound    rsuf xs  = maybe True (\ pre -> xs == pre ++ reverse rsuf) $ stripReversedSuffix rsuf xs
+prop_stripReversedSuffix_complete pre rsuf = stripReversedSuffix rsuf (pre ++ reverse rsuf) == Just pre
+
+prop_suffixesSatisfying :: (Int -> Bool) -> [Int] -> Bool
+prop_suffixesSatisfying p xs =
+  suffixesSatisfying p xs == map (all p) (List.init (List.tails xs))
 
 prop_chop_intercalate :: Property
 prop_chop_intercalate =
@@ -44,6 +73,26 @@ prop_chop_intercalate =
 
 prop_distinct_fastDistinct :: [Integer] -> Bool
 prop_distinct_fastDistinct xs = distinct xs == fastDistinct xs
+
+-- To test duplicates, we distinguish them with a decoration by some small natural number.
+
+data Decorate a = Decorate (Positive (Small Int)) a
+  deriving (Show)
+
+instance Eq a => Eq (Decorate a) where
+  (==) = (==) `on` (\ (Decorate _ a) -> a)
+
+instance Ord a => Ord (Decorate a) where
+  compare = compare `on` (\ (Decorate _ a) -> a)
+
+instance Arbitrary a => Arbitrary (Decorate a) where
+  arbitrary = Decorate <$> arbitrary <*> arbitrary
+
+prop_allDuplicates :: [Decorate (Positive Int)] -> Bool
+prop_allDuplicates xs = allDuplicates xs `sameList` sort (xs \\ nub xs)
+  where
+  sameList xs ys = and $ zipWith same xs ys
+  same (Decorate i a) (Decorate j b) = i == j && a == b
 
 prop_groupBy' :: (Bool -> Bool -> Bool) -> [Bool] -> Property
 prop_groupBy' p xs =
@@ -99,25 +148,23 @@ prop_zipWithKeepRest_init_zipWith f as bs =
 prop_nubOn :: (Integer -> Integer) -> [Integer] -> Bool
 prop_nubOn f xs = nubOn f xs == nubBy ((==) `on` f) xs
 
-prop_uniqOn1 :: (Integer -> Integer) -> [Integer] -> Bool
-prop_uniqOn1 f xs' =
-  or [ uniqOn f xs == nubBy ((==) `on` f) ys
-     | ys <- permutations xs
-     ]
+prop_nubFavouriteOn ::
+  Fun Integer Integer -> Fun Integer Bool -> [Integer] -> Property
+prop_nubFavouriteOn (Fun _ f) (Fun _ p) xs =
+  nubFavouriteOn f p xs ===
+  map fst (sortBy (compare `on` snd) (find p xs ++ find (not . p) xs))
   where
-  xs = take 5 xs'
+  find p xs =
+    case filter (p . fst) $ zip xs [0..] of
+      [] -> []
+      xs -> [minimumBy (compare `on` first f) xs]
 
-  permutations []       = [[]]
-  permutations (x : xs) =
-    [ ys1 ++ x : ys2
-    | ys <- permutations xs
-    , n  <- [0..length ys]
-    , let (ys1, ys2) = splitAt n ys
-    ]
+prop_nubAndDuplicatesOn :: (Integer -> Integer) -> [Integer] -> Bool
+prop_nubAndDuplicatesOn f xs = nubAndDuplicatesOn f xs == (ys, xs \\ ys)
+  where ys = nubBy ((==) `on` f) xs
 
-prop_uniqOn2 :: (Integer -> Integer) -> [Integer] -> Bool
-prop_uniqOn2 f xs =
-  sortBy (compare `on` f) (uniqOn f xs) == uniqOn f xs
+prop_uniqOn1 :: (Integer -> Integer) -> [Integer] -> Bool
+prop_uniqOn1 f xs = uniqOn f xs == sortBy (compare `on` f) (nubBy ((==) `on` f) xs)
 
 prop_commonPrefix :: [Integer] -> [Integer] -> [Integer] -> Bool
 prop_commonPrefix xs ys zs =
@@ -134,6 +181,16 @@ prop_commonSuffix xs ys zs =
       , isSuffixOf zs' (ys ++ zs) ]
   where
     zs' = commonSuffix (xs ++ zs) (ys ++ zs)
+
+-- | If @xs@, @ys@ and @zs@ are pairwise disjoint, then the overlap between
+--   @xs ++ ys@ and @ys ++ zs@ is certainly @ys@.
+prop_findOverlap :: [Int] -> [Int] -> [Int] -> Bool
+prop_findOverlap xs ys zs = findOverlap (xs1 ++ ys2) (ys2 ++ zs3) == (length xs, length ys)
+  where
+  -- Make sure the lists are disjoint.
+  xs1 = (,1) <$> xs
+  ys2 = (,2) <$> ys
+  zs3 = (,3) <$> zs
 
 prop_editDistance :: Property
 prop_editDistance =

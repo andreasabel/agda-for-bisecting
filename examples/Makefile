@@ -22,6 +22,7 @@ default : ac \
           regexp-talk \
           relocatable-interfaces \
           simplelib \
+          uptodate \
           view \
 
 agda = $(AGDA_BIN)
@@ -169,8 +170,18 @@ relocatable-interfaces : relocatable/originals/*.agda
 	@$(agda) -v2 -irelocatable/copies --no-libraries relocatable/copies/C.agda > relocatable/copies/output
 	@cat relocatable/copies/output
 				# ...and skips one of the modules (A).
-	@[ `grep "^ *Loading" relocatable/copies/output | wc -l` = 1 ]
+	@[ `grep "^ *Checking A" relocatable/copies/output | wc -l` = 0 ]
+	@[ `grep "^ *Checking B" relocatable/copies/output | wc -l` = 1 ]
+	@[ `grep "^ *Checking C" relocatable/copies/output | wc -l` = 1 ]
 	@rm -rf relocatable/copies
+
+.PHONY : uptodate
+uptodate : uptodate/*.agda
+	@$(echo) "Testing that already imported modules are up-to-date" # despite having DOS line-endings
+	@$(agda) -v5 --ignore-interfaces -iuptodate --no-libraries uptodate/A.agda > uptodate/output
+	@cat uptodate/output
+	@[ `grep "C is up-to-date" uptodate/output | wc -l` = 1 ]
+	@rm -f uptodate/output
 
 .PHONY : malformed-interfaces
 malformed-interfaces : malformed/Empty.agda

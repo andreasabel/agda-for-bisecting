@@ -35,24 +35,61 @@ keywords
   can appear in a name together with other characters.
 
   ``=`` ``|`` ``->`` ``→`` ``:`` ``?`` ``\`` ``λ``
-  :ref:`∀ <notational-conventions>` ``..`` ``...`` ``abstract``
-  ``codata`` :ref:`coinductive <copatterns-coinductive-records>`
-  ``constructor`` ``data`` :ref:`do <do-notation>` ``eta-equality`` ``field``
-  :ref:`forall <notational-conventions>` ``hiding`` ``import`` ``in``
-  ``inductive`` ``infix`` ``infixl`` ``infixr`` ``instance`` ``let``
-  :ref:`macro <macros>` ``module`` ``mutual`` ``no-eta-equality``
-  ``open`` :ref:`overlap <instance-fields>` ``pattern`` ``postulate``
-  ``primitive`` ``private`` ``public`` :ref:`quote <reflection>`
-  ``quoteContext`` ``quoteGoal`` :ref:`quoteTerm <macros>` ``record``
-  ``renaming`` ``rewrite`` ``Set`` ``syntax`` ``tactic``
-  :ref:`unquote <macros>` :ref:`unquoteDecl <unquoting-declarations>`
-  :ref:`unquoteDef <unquoting-declarations>` ``using`` ``where``
+  :ref:`∀ <notational-conventions>` ``..`` ``...``
+  ``abstract``
+  ``coinductive``
+  ``constructor``
+  ``data``
+  :ref:`do <do-notation>`
+  ``eta-equality``
+  ``field``
+  :ref:`forall <notational-conventions>`
+  ``import``
+  ``in``
+  ``inductive``
+  ``infix``
+  ``infixl``
+  ``infixr``
+  ``instance``
+  ``interleaved``
+  ``let``
+  :ref:`macro <macros>`
+  ``module``
+  ``mutual``
+  ``no-eta-equality``
+  ``open``
+  :ref:`overlap <instance-fields>`
+  ``pattern``
+  ``postulate``
+  ``primitive``
+  ``private``
+  :ref:`quote <reflection>`
+  :ref:`quoteTerm <macros>`
+  ``record``
+  ``rewrite``
+  ``Set``
+  ``syntax``
+  ``tactic``
+  :ref:`unquote <macros>`
+  :ref:`unquoteDecl <unquoting-declarations>`
+  :ref:`unquoteDef <unquoting-declarations>`
+  :ref:`variable <generalization-of-declared-variables>`
+  ``where``
   ``with``
 
-  The ``Set`` keyword can appear with a number suffix, optionally subscripted
-  (see :ref:`universe-levels`). For instance ``Set42`` and ``Set₄₂`` are both
-  keywords.
+  The ``Set`` keyword can appear with a natural number suffix, optionally
+  subscripted (see :ref:`sort-system`). For instance ``Set42`` and
+  ``Set₄₂`` are both keywords.
 
+keywords in import directives
+  The following words are only reserved in import directives
+  (in connection with ``import`` or ``open``):
+
+  ``public``
+  ``using``
+  ``hiding``
+  ``renaming``
+  ``to``
 
 .. _names:
 
@@ -97,13 +134,15 @@ strings. See :ref:`built-ins` for the corresponding types, and
 .. _lexical-structure-int-literals:
 
 Integers
-  Integer values in decimal or hexadecimal (prefixed by ``0x``) notation.
-  Non-negative numbers map by default to :ref:`built-in natural numbers
-  <built-in-nat>`, but can be overloaded. Negative numbers have no default
-  interpretation and can only be used through :ref:`overloading
+  Integer values in decimal, hexadecimal (prefixed by ``0x``), or binary
+  (prefixed by ``0b``) notation. The character `_` can be used to separate
+  groups of digits. Non-negative numbers map by default to :ref:`built-in
+  natural numbers <built-in-nat>`, but can be overloaded. Negative numbers have
+  no default interpretation and can only be used through :ref:`overloading
   <literal-overloading>`.
 
-  Examples: ``123``, ``0xF0F080``, ``-42``, ``-0xF``
+  Examples: ``123``, ``0xF0F080``, ``-42``, ``-0xF``, ``0b11001001``,
+  ``1_000_000_000``, ``0b01001000_01001001``.
 
 .. _lexical-structure-float-literals:
 
@@ -213,7 +252,19 @@ layout keywords:
 
 .. code-block:: none
 
-   abstract do field instance let macro mutual postulate primitive private where
+   abstract
+   constructor
+   do
+   field
+   instance
+   let
+   macro
+   mutual
+   postulate
+   primitive
+   private
+   variable
+   where
 
 The first token after the layout keyword decides the indentation of the block.
 Any token indented more than this is part of the previous statement, a token at
@@ -233,6 +284,16 @@ the block.
 
 Note that the indentation of the layout keyword does not matter.
 
+If several layout blocks are started by layout keywords without line
+break in between (where line breaks inside block comments do not
+count), then those blocks indented *more* than the last block go
+passive, meaning they cannot be further extended by new statements::
+
+  private module M where postulate
+            A : Set                 -- module-block goes passive
+            B : Set                 -- postulate-block can still be extended
+          module N where            -- private-block can still be extended
+
 An Agda file contains one top-level layout block, with the special rule that
 the contents of the top-level module need not be indented.
 
@@ -245,11 +306,14 @@ the contents of the top-level module need not be indented.
 Literate Agda
 -------------
 
-Agda supports `literate programming <literate_>`_ where everything in a file is
-a comment unless enclosed in ``\begin{code}``, ``\end{code}``. Literate Agda
-files have the extension ``.lagda`` instead of ``.agda``. The main use case for
-literate Agda is to generate LaTeX documents from Agda code. See
-:any:`generating-latex` for more information.
+Agda supports `literate programming <literate_>`_ with multiple typesetting
+tools like LaTeX, Markdown and reStructuredText. For instance, with LaTeX,
+everything in a file is a comment unless enclosed in ``\begin{code}``,
+``\end{code}``. Literate Agda files have special file extensions, like
+``.lagda`` and ``.lagda.tex`` for LaTeX, ``.lagda.md`` for Markdown,
+``.lagda.rst`` for reStructuredText instead of ``.agda``. The main use case
+for literate Agda is to generate LaTeX documents from Agda code. See
+:any:`generating-html` and :any:`generating-latex` for more information.
 
 .. code-block:: latex
 

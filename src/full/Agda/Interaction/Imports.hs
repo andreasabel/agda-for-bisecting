@@ -1,53 +1,77 @@
-{-# LANGUAGE CPP               #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE NondecreasingIndentation #-}
+{-# LANGUAGE RecursiveDo #-}
 
 {-| This module deals with finding imported modules and loading their
     interface files.
 -}
-module Agda.Interaction.Imports where
+module Agda.Interaction.Imports
+  ( Mode, pattern ScopeCheck, pattern TypeCheck
+
+  , CheckResult (CheckResult)
+  , crModuleInfo
+  , crInterface
+  , crWarnings
+  , crMode
+  , crSource
+
+  , Source(..)
+  , scopeCheckImport
+  , parseSource
+  , typeCheckMain
+
+  -- Currently only used by test/api/Issue1168.hs:
+  , readInterface
+  ) where
 
 import Prelude hiding (null)
 
-import Control.Arrow
-import Control.DeepSeq
-import Control.Monad.Reader
+import Control.Monad               ( forM, forM_, void )
+import Control.Monad.Except
+import Control.Monad.IO.Class      ( MonadIO(..) )
 import Control.Monad.State
 import Control.Monad.Trans.Maybe
 import qualified Control.Exception as E
 
-import Data.Function (on)
-import qualified Data.Map as Map
-import qualified Data.List as List
-import qualified Data.Set as Set
-import qualified Data.Foldable as Fold (toList)
+#if __GLASGOW_HASKELL__ < 808
+import Control.Monad.Fail (MonadFail)
+#endif
+
+import Data.Either
 import qualified Data.List as List
 import Data.Maybe
-import Data.Monoid (mempty, mappend)
 import Data.Map (Map)
+import qualified Data.Map as Map
+import qualified Data.HashMap.Strict as HMap
+import qualified Data.HashSet as HSet
 import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Text (Text)
+import qualified Data.Text.Lazy as TL
 
-import System.Directory (doesFileExist, getModificationTime, removeFile)
-import System.FilePath ((</>))
-
-import qualified Text.PrettyPrint.Boxes as Boxes
+import System.Directory (doesFileExist, removeFile)
+import System.FilePath ((</>), takeDirectory)
 
 import Agda.Benchmarking
 
 import qualified Agda.Syntax.Abstract as A
 import qualified Agda.Syntax.Concrete as C
+import Agda.Syntax.Concrete.Attribute
 import Agda.Syntax.Abstract.Name
+import Agda.Syntax.Common
 import Agda.Syntax.Parser
 import Agda.Syntax.Position
 import Agda.Syntax.Scope.Base
-import Agda.Syntax.Translation.ConcreteToAbstract
-import Agda.Syntax.Internal
+import Agda.Syntax.TopLevelModuleName
+import Agda.Syntax.Translation.ConcreteToAbstract as CToA
 
 import Agda.TypeChecking.Errors
-import Agda.TypeChecking.Warnings
+import Agda.TypeChecking.Warnings hiding (warnings)
 import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Rewriting.Confluence ( checkConfluenceOfRules )
 import Agda.TypeChecking.MetaVars ( openMetasToPostulates )
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Serialise
-import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Primitive
 import Agda.TypeChecking.Pretty as P
 import Agda.TypeChecking.DeadCode
@@ -55,18 +79,18 @@ import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 
 import Agda.TheTypeChecker
 
+import Agda.Interaction.BasicOps ( getGoals, showGoals )
 import Agda.Interaction.FindFile
-import {-# SOURCE #-} Agda.Interaction.InteractionTop (showOpenMetas)
+import Agda.Interaction.Highlighting.Generate
+import Agda.Interaction.Highlighting.Precise  ( convert )
+import Agda.Interaction.Highlighting.Vim
+import Agda.Interaction.Library
 import Agda.Interaction.Options
 import qualified Agda.Interaction.Options.Lenses as Lens
-import Agda.Interaction.Highlighting.Precise
-  (HighlightingInfo, compress)
-import Agda.Interaction.Highlighting.Generate
-import Agda.Interaction.Highlighting.Vim
+import Agda.Interaction.Options.Warnings (unsolvedWarnings)
 import Agda.Interaction.Response
   (RemoveTokenBasedHighlighting(KeepHighlighting))
 
-import Agda.Utils.Except ( MonadError(catchError, throwError) )
 import Agda.Utils.FileName
 import Agda.Utils.Lens
 import Agda.Utils.Maybe
@@ -75,13 +99,79 @@ import Agda.Utils.Monad
 import Agda.Utils.Null
 import Agda.Utils.IO.Binary
 import Agda.Utils.Pretty hiding (Mode)
-import Agda.Utils.Time
+import qualified Agda.Utils.ProfileOptions as Profile
 import Agda.Utils.Hash
-import qualified Agda.Utils.HashMap as HMap
 import qualified Agda.Utils.Trie as Trie
+import Agda.Utils.WithDefault
 
-#include "undefined.h"
 import Agda.Utils.Impossible
+
+-- | Whether to ignore interfaces (@.agdai@) other than built-in modules
+
+ignoreInterfaces :: HasOptions m => m Bool
+ignoreInterfaces = optIgnoreInterfaces <$> commandLineOptions
+
+-- | Whether to ignore all interface files (@.agdai@)
+
+ignoreAllInterfaces :: HasOptions m => m Bool
+ignoreAllInterfaces = optIgnoreAllInterfaces <$> commandLineOptions
+
+-- | The decorated source code.
+
+data Source = Source
+  { srcText        :: TL.Text               -- ^ Source code.
+  , srcFileType    :: FileType              -- ^ Source file type
+  , srcOrigin      :: SourceFile            -- ^ Source location at the time of its parsing
+  , srcModule      :: C.Module              -- ^ The parsed module.
+  , srcModuleName  :: TopLevelModuleName    -- ^ The top-level module name.
+  , srcProjectLibs :: [AgdaLibFile]         -- ^ The .agda-lib file(s) of the project this file belongs to.
+  , srcCohesion    :: !CohesionAttributes
+    -- ^ Every encountered occurrence of a cohesion attribute.
+  }
+
+-- | Parses a source file and prepares the 'Source' record.
+
+parseSource :: SourceFile -> TCM Source
+parseSource sourceFile@(SourceFile f) = Bench.billTo [Bench.Parsing] $ do
+  (source, fileType, parsedMod, coh, parsedModName) <- mdo
+    -- This piece of code uses mdo because the top-level module name
+    -- (parsedModName) is obtained from the parser's result, but it is
+    -- also used by the parser.
+    let rf = mkRangeFile f (Just parsedModName)
+    source                       <- runPM $ readFilePM rf
+    ((parsedMod, coh), fileType) <- runPM $ parseFile moduleParser rf $
+                                    TL.unpack source
+    parsedModName                <- moduleName f parsedMod
+    return (source, fileType, parsedMod, coh, parsedModName)
+  libs <- getAgdaLibFiles f parsedModName
+  return Source
+    { srcText        = source
+    , srcFileType    = fileType
+    , srcOrigin      = sourceFile
+    , srcModule      = parsedMod
+    , srcModuleName  = parsedModName
+    , srcProjectLibs = libs
+    , srcCohesion    = coh
+    }
+
+srcDefaultPragmas :: Source -> [OptionsPragma]
+srcDefaultPragmas src = map _libPragmas (srcProjectLibs src)
+
+srcFilePragmas :: Source -> [OptionsPragma]
+srcFilePragmas src = pragmas
+  where
+  cpragmas = C.modPragmas (srcModule src)
+  pragmas = [ opts | C.OptionsPragma _ opts <- cpragmas ]
+
+srcPragmas :: Source -> [OptionsPragma]
+srcPragmas src = srcDefaultPragmas src ++ srcFilePragmas src
+
+-- | Set options from a 'Source' pragma, using the source
+--   ranges of the pragmas for error reporting.
+setOptionsFromSourcePragmas :: Source -> TCM ()
+setOptionsFromSourcePragmas src =
+  setCurrentRange (C.modPragmas . srcModule $ src) $
+    mapM_ setOptionsFromPragma (srcPragmas src)
 
 -- | Is the aim to type-check the top-level module, or only to
 -- scope-check it?
@@ -110,120 +200,199 @@ includeStateChanges :: MainInterface -> Bool
 includeStateChanges (MainInterface _) = True
 includeStateChanges NotMainInterface  = False
 
+-- | The kind of interface produced by 'createInterface'
+moduleCheckMode :: MainInterface -> ModuleCheckMode
+moduleCheckMode = \case
+    MainInterface TypeCheck                       -> ModuleTypeChecked
+    NotMainInterface                              -> ModuleTypeChecked
+    MainInterface ScopeCheck                      -> ModuleScopeChecked
+
 -- | Merge an interface into the current proof state.
 mergeInterface :: Interface -> TCM ()
 mergeInterface i = do
     let sig     = iSignature i
-        builtin = Map.toList $ iBuiltin i
-        prim    = [ x | (_,Prim x) <- builtin ]
-        bi      = Map.fromList [ (x,Builtin t) | (x,Builtin t) <- builtin ]
+        builtin = Map.toAscList $ iBuiltin i
+        primOrBi = \case
+          (_, Prim x)                     -> Left x
+          (x, Builtin t)                  -> Right (x, Builtin t)
+          (x, BuiltinRewriteRelations xs) -> Right (x, BuiltinRewriteRelations xs)
+        (prim, bi') = partitionEithers $ map primOrBi builtin
+        bi      = Map.fromDistinctAscList bi'
         warns   = iWarnings i
     bs <- getsTC stBuiltinThings
-    reportSLn "import.iface.merge" 10 $ "Merging interface"
+    reportSLn "import.iface.merge" 10 "Merging interface"
     reportSLn "import.iface.merge" 20 $
       "  Current builtins " ++ show (Map.keys bs) ++ "\n" ++
       "  New builtins     " ++ show (Map.keys bi)
-    let check b = case (b1, b2) of
-            (Builtin x, Builtin y)
-              | x == y    -> return ()
-              | otherwise -> typeError $ DuplicateBuiltinBinding b x y
-            _ -> __IMPOSSIBLE__
-          where
-            Just b1 = Map.lookup b bs
-            Just b2 = Map.lookup b bi
-    mapM_ check (map fst $ Map.toList $ Map.intersection bs bi)
-    addImportedThings sig bi (iPatternSyns i) (iDisplayForms i) (iUserWarnings i) warns
+    let check b (Builtin x) (Builtin y)
+              | x == y    = return ()
+              | otherwise = typeError $ DuplicateBuiltinBinding b x y
+        check _ (BuiltinRewriteRelations xs) (BuiltinRewriteRelations ys) = return ()
+        check _ _ _ = __IMPOSSIBLE__
+    sequence_ $ Map.intersectionWithKey check bs bi
+    addImportedThings
+      sig
+      (iMetaBindings i)
+      bi
+      (iPatternSyns i)
+      (iDisplayForms i)
+      (iUserWarnings i)
+      (iPartialDefs i)
+      warns
     reportSLn "import.iface.merge" 20 $
       "  Rebinding primitives " ++ show prim
     mapM_ rebind prim
+    whenJustM (optConfluenceCheck <$> pragmaOptions) $ \confChk -> do
+      reportSLn "import.iface.confluence" 20 $ "  Checking confluence of imported rewrite rules"
+      checkConfluenceOfRules confChk $ concat $ HMap.elems $ sig ^. sigRewriteRules
     where
         rebind (x, q) = do
             PrimImpl _ pf <- lookupPrimitiveFunction x
             stImportedBuiltins `modifyTCLens` Map.insert x (Prim pf{ primFunName = q })
 
-addImportedThings ::
-  Signature -> BuiltinThings PrimFun ->
-  A.PatternSynDefns -> DisplayForms -> Map A.QName String -> [TCWarning] -> TCM ()
-addImportedThings isig ibuiltin patsyns display userwarn warnings = do
+addImportedThings
+  :: Signature
+  -> RemoteMetaStore
+  -> BuiltinThings PrimFun
+  -> A.PatternSynDefns
+  -> DisplayForms
+  -> Map A.QName Text      -- ^ Imported user warnings
+  -> Set QName             -- ^ Name of imported definitions which are partial
+  -> [TCWarning]
+  -> TCM ()
+addImportedThings isig metas ibuiltin patsyns display userwarn
+                  partialdefs warnings = do
   stImports              `modifyTCLens` \ imp -> unionSignatures [imp, isig]
+  stImportedMetaStore    `modifyTCLens` HMap.union metas
   stImportedBuiltins     `modifyTCLens` \ imp -> Map.union imp ibuiltin
   stImportedUserWarnings `modifyTCLens` \ imp -> Map.union imp userwarn
+  stImportedPartialDefs  `modifyTCLens` \ imp -> Set.union imp partialdefs
   stPatternSynImports    `modifyTCLens` \ imp -> Map.union imp patsyns
   stImportedDisplayForms `modifyTCLens` \ imp -> HMap.unionWith (++) imp display
-  stTCWarnings           `modifyTCLens` \ imp -> List.union imp warnings
+  stTCWarnings           `modifyTCLens` \ imp -> imp `List.union` warnings
   addImportedInstances isig
 
 -- | Scope checks the given module. A proper version of the module
 -- name (with correct definition sites) is returned.
 
-scopeCheckImport :: ModuleName -> TCM (ModuleName, Map ModuleName Scope)
-scopeCheckImport x = do
+scopeCheckImport ::
+  TopLevelModuleName -> ModuleName ->
+  TCM (ModuleName, Map ModuleName Scope)
+scopeCheckImport top x = do
     reportSLn "import.scope" 5 $ "Scope checking " ++ prettyShow x
     verboseS "import.scope" 10 $ do
-      visited <- Map.keys <$> getVisitedModules
-      reportSLn "import.scope" 10 $
-        "  visited: " ++ List.intercalate ", " (map prettyShow visited)
+      visited <- prettyShow <$> getPrettyVisitedModules
+      reportSLn "import.scope" 10 $ "  visited: " ++ visited
     -- Since scopeCheckImport is called from the scope checker,
     -- we need to reimburse her account.
-    i <- Bench.billTo [] $ getInterface x
-    addImport x
+    i <- Bench.billTo [] $ getNonMainInterface top Nothing
+    addImport top
+
+    -- If that interface was supposed to raise a warning on import, do so.
+    whenJust (iImportWarning i) $ warning . UserWarning
+
     -- let s = publicModules $ iInsideScope i
     let s = iScope i
     return (iModuleName i `withRangesOfQ` mnameToConcrete x, s)
 
-data MaybeWarnings' a = NoWarnings | SomeWarnings a
-  deriving (Functor, Foldable, Traversable)
-type MaybeWarnings = MaybeWarnings' [TCWarning]
-
-applyFlagsToMaybeWarnings :: IgnoreFlags -> MaybeWarnings -> TCM MaybeWarnings
-applyFlagsToMaybeWarnings r mw = do
-  w' <- traverse (applyFlagsToTCWarnings r) mw
-  return $ if null w' then NoWarnings else w'
-
-instance Null a => Null (MaybeWarnings' a) where
-  empty = NoWarnings
-  null mws = case mws of
-    NoWarnings      -> True
-    SomeWarnings ws -> null ws
-
-hasWarnings :: MaybeWarnings -> Bool
-hasWarnings = not . null
-
 -- | If the module has already been visited (without warnings), then
 -- its interface is returned directly. Otherwise the computation is
 -- used to find the interface and the computed interface is stored for
--- potential later use (unless the 'MainInterface' is @'MainInterface'
--- 'ScopeCheck'@).
+-- potential later use.
 
-alreadyVisited :: C.TopLevelModuleName ->
+alreadyVisited :: TopLevelModuleName ->
                   MainInterface ->
-                  TCM (Interface, MaybeWarnings) ->
-                  TCM (Interface, MaybeWarnings)
-alreadyVisited x isMain getIface = do
-    mm <- getVisitedModule x
-    case mm of
-        -- A module with warnings should never be allowed to be
-        -- imported from another module.
-        Just mi | not (miWarnings mi) -> do
-          reportSLn "import.visit" 10 $ "  Already visited " ++ prettyShow x
-          return (miInterface mi, NoWarnings)
-        _ -> do
-          reportSLn "import.visit" 5 $ "  Getting interface for " ++ prettyShow x
-          r@(i, wt) <- getIface
-          reportSLn "import.visit" 5 $ "  Now we've looked at " ++ prettyShow x
-          unless (isMain == MainInterface ScopeCheck) $
-            visitModule $ ModuleInfo
-              { miInterface  = i
-              , miWarnings   = hasWarnings wt
-              }
-          return r
+                  PragmaOptions ->
+                  TCM ModuleInfo ->
+                  TCM ModuleInfo
+alreadyVisited x isMain currentOptions getModule =
+  case isMain of
+    MainInterface TypeCheck                       -> useExistingOrLoadAndRecordVisited ModuleTypeChecked
+    NotMainInterface                              -> useExistingOrLoadAndRecordVisited ModuleTypeChecked
+    MainInterface ScopeCheck                      -> useExistingOrLoadAndRecordVisited ModuleScopeChecked
+  where
+  useExistingOrLoadAndRecordVisited :: ModuleCheckMode -> TCM ModuleInfo
+  useExistingOrLoadAndRecordVisited mode = fromMaybeM loadAndRecordVisited (existingWithoutWarnings mode)
+
+  -- Case: already visited.
+  --
+  -- A module with warnings should never be allowed to be
+  -- imported from another module.
+  existingWithoutWarnings :: ModuleCheckMode -> TCM (Maybe ModuleInfo)
+  existingWithoutWarnings mode = runMaybeT $ exceptToMaybeT $ do
+    mi <- maybeToExceptT "interface has not been visited in this context" $ MaybeT $
+      getVisitedModule x
+
+    when (miMode mi < mode) $
+      throwError "previously-visited interface was not sufficiently checked"
+
+    unless (null $ miWarnings mi) $
+      throwError "previously-visited interface had warnings"
+
+    reportSLn "import.visit" 10 $ "  Already visited " ++ prettyShow x
+
+    lift $ processResultingModule mi
+
+  processResultingModule :: ModuleInfo -> TCM ModuleInfo
+  processResultingModule mi = do
+    let ModuleInfo { miInterface = i, miPrimitive = isPrim, miWarnings = ws } = mi
+
+    -- Check that imported options are compatible with current ones (issue #2487),
+    -- but give primitive modules a pass
+    -- compute updated warnings if needed
+    wt <- fromMaybe ws <$> (getOptionsCompatibilityWarnings isMain isPrim currentOptions i)
+
+    return mi { miWarnings = wt }
+
+  loadAndRecordVisited :: TCM ModuleInfo
+  loadAndRecordVisited = do
+    reportSLn "import.visit" 5 $ "  Getting interface for " ++ prettyShow x
+    mi <- processResultingModule =<< getModule
+    reportSLn "import.visit" 5 $ "  Now we've looked at " ++ prettyShow x
+
+    -- Interfaces are not stored if we are only scope-checking, or
+    -- if any warnings were encountered.
+    case (isMain, miWarnings mi) of
+      (MainInterface ScopeCheck, _) -> return ()
+      (_, _:_)                      -> return ()
+      _                             -> storeDecodedModule mi
+
+    reportS "warning.import" 10
+      [ "module: " ++ show (moduleNameParts x)
+      , "WarningOnImport: " ++ show (iImportWarning (miInterface mi))
+      ]
+
+    visitModule mi
+    return mi
+
+
+-- | The result and associated parameters of a type-checked file,
+--   when invoked directly via interaction or a backend.
+--   Note that the constructor is not exported.
+
+data CheckResult = CheckResult'
+  { crModuleInfo :: ModuleInfo
+  , crSource'    :: Source
+  }
+
+-- | Flattened unidirectional pattern for 'CheckResult' for destructuring inside
+--   the 'ModuleInfo' field.
+pattern CheckResult :: Interface -> [TCWarning] -> ModuleCheckMode -> Source -> CheckResult
+pattern CheckResult { crInterface, crWarnings, crMode, crSource } <- CheckResult'
+    { crModuleInfo = ModuleInfo
+        { miInterface = crInterface
+        , miWarnings = crWarnings
+        , miMode = crMode
+        }
+    , crSource' = crSource
+    }
 
 -- | Type checks the main file of the interaction.
 --   This could be the file loaded in the interacting editor (emacs),
 --   or the file passed on the command line.
 --
 --   First, the primitive modules are imported.
---   Then, @getInterface'@ is called to do the main work.
+--   Then, @getInterface@ is called to do the main work.
 --
 --   If the 'Mode' is 'ScopeCheck', then type-checking is not
 --   performed, only scope-checking. (This may include type-checking
@@ -232,34 +401,59 @@ alreadyVisited x isMain getIface = do
 --   however, that if the file has already been type-checked, then a
 --   complete interface is returned.
 
-typeCheckMain :: AbsolutePath -> Mode -> TCM (Interface, MaybeWarnings)
-typeCheckMain f mode = do
+typeCheckMain
+  :: Mode
+     -- ^ Should the file be type-checked, or only scope-checked?
+  -> Source
+     -- ^ The decorated source code.
+  -> TCM CheckResult
+typeCheckMain mode src = do
   -- liftIO $ putStrLn $ "This is typeCheckMain " ++ prettyShow f
   -- liftIO . putStrLn . show =<< getVerbosity
-  reportSLn "import.main" 10 $ "Importing the primitive modules."
-  libdir <- liftIO defaultLibDir
-  reportSLn "import.main" 20 $ "Library dir = " ++ show libdir
-  -- To allow posulating the built-ins, check the primitive module
-  -- in unsafe mode
-  _ <- bracket_ (getsTC $ Lens.getSafeMode) Lens.putSafeMode $ do
-    Lens.putSafeMode False
+
+  -- For the main interface, we also remember the pragmas from the file
+  setOptionsFromSourcePragmas src
+  loadPrims <- optLoadPrimitives <$> pragmaOptions
+
+  when loadPrims $ do
+    reportSLn "import.main" 10 "Importing the primitive modules."
+    libdirPrim <- liftIO getPrimitiveLibDir
+    reportSLn "import.main" 20 $ "Library primitive dir = " ++ show libdirPrim
     -- Turn off import-chasing messages.
     -- We have to modify the persistent verbosity setting, since
     -- getInterface resets the current verbosity settings to the persistent ones.
-    bracket_ (getsTC $ Lens.getPersistentVerbosity) Lens.putPersistentVerbosity $ do
-      Lens.modifyPersistentVerbosity (Trie.delete [])  -- set root verbosity to 0
+
+    bracket_ (getsTC Lens.getPersistentVerbosity) Lens.putPersistentVerbosity $ do
+      Lens.modifyPersistentVerbosity
+        (Strict.Just . Trie.insert [] 0 . Strict.fromMaybe Trie.empty)
+        -- set root verbosity to 0
+
       -- We don't want to generate highlighting information for Agda.Primitive.
       withHighlightingLevel None $
-        forM_ [libdir </> "prim" </> "Agda" </> "Primitive.agda"
-              ,libdir </> "prim" </> "Agda" </> "Primitive" </> "Cubical.agda"
-              ] $ \ mname ->
-          getInterface_ =<< do
-            moduleName $ mkAbsolute $ mname
-  reportSLn "import.main" 10 $ "Done importing the primitive modules."
+        forM_ (Set.map (libdirPrim </>) Lens.primitiveModules) $ \f -> do
+          primSource <- parseSource (SourceFile $ mkAbsolute f)
+          checkModuleName' (srcModuleName primSource) (srcOrigin primSource)
+          void $ getNonMainInterface (srcModuleName primSource) (Just primSource)
+
+    reportSLn "import.main" 10 $ "Done importing the primitive modules."
 
   -- Now do the type checking via getInterface.
-  m <- moduleName f
-  getInterface' m (MainInterface mode)
+  checkModuleName' (srcModuleName src) (srcOrigin src)
+
+  mi <- getInterface (srcModuleName src) (MainInterface mode) (Just src)
+
+  stCurrentModule `setTCLens'`
+    Just ( iModuleName (miInterface mi)
+         , iTopLevelModuleName (miInterface mi)
+         )
+
+  return $ CheckResult' mi src
+  where
+  checkModuleName' m f =
+    -- Andreas, 2016-07-11, issue 2092
+    -- The error range should be set to the file with the wrong module name
+    -- not the importing one (which would be the default).
+    setCurrentRange m $ checkModuleName m f Nothing
 
 -- | Tries to return the interface associated to the given (imported) module.
 --   The time stamp of the relevant interface file is also returned.
@@ -269,193 +463,287 @@ typeCheckMain f mode = do
 --
 --   Do not use this for the main file, use 'typeCheckMain' instead.
 
-getInterface :: ModuleName -> TCM Interface
-getInterface = getInterface_ . toTopLevelModuleName
+getNonMainInterface
+  :: TopLevelModuleName
+  -> Maybe Source
+     -- ^ Optional: the source code and some information about the source code.
+  -> TCM Interface
+getNonMainInterface x msrc = do
+  -- Preserve/restore the current pragma options, which will be mutated when loading
+  -- and checking the interface.
+  mi <- bracket_ (useTC stPragmaOptions) (stPragmaOptions `setTCLens`) $
+          getInterface x NotMainInterface msrc
+  tcWarningsToError $ miWarnings mi
+  return (miInterface mi)
 
--- | See 'getInterface'.
-
-getInterface_ :: C.TopLevelModuleName -> TCM Interface
-getInterface_ x = do
-  (i, wt) <- getInterface' x NotMainInterface
-  case wt of
-    SomeWarnings w  -> tcWarningsToError (filter (notIM . tcWarning) w)
-    NoWarnings      -> return i
-   -- filter out unsolved interaction points for imported module so
-   -- that we get the right error message (see test case Fail/Issue1296)
-   where notIM UnsolvedInteractionMetas{} = False
-         notIM _                          = True
-
-
--- | A more precise variant of 'getInterface'. If warnings are
+-- | A more precise variant of 'getNonMainInterface'. If warnings are
 -- encountered then they are returned instead of being turned into
 -- errors.
 
-getInterface'
-  :: C.TopLevelModuleName
+getInterface
+  :: TopLevelModuleName
   -> MainInterface
-  -> TCM (Interface, MaybeWarnings)
-getInterface' x isMain = do
-  withIncreasedModuleNestingLevel $ do
-    -- Preserve the pragma options unless we are checking the main
-    -- interface.
-    bracket_ (useTC stPragmaOptions)
-             (unless (includeStateChanges isMain) . (stPragmaOptions `setTCLens`)) $ do
-     -- Forget the pragma options (locally).
-     setCommandLineOptions . stPersistentOptions . stPersistentState =<< getTC
+  -> Maybe Source
+     -- ^ Optional: the source code and some information about the source code.
+  -> TCM ModuleInfo
+getInterface x isMain msrc =
+  addImportCycleCheck x $ do
+     -- We remember but reset the pragma options locally
+     -- Issue #3644 (Abel 2020-05-08): Set approximate range for errors in options
+     currentOptions <- useTC stPragmaOptions
+     setCurrentRange (C.modPragmas . srcModule <$> msrc) $
+       -- Now reset the options
+       setCommandLineOptions . stPersistentOptions . stPersistentState =<< getTC
 
-     alreadyVisited x isMain $ addImportCycleCheck x $ do
-      file <- findFile x  -- requires source to exist
+     alreadyVisited x isMain currentOptions $ do
+      file <- case msrc of
+        Nothing  -> findFile x
+        Just src -> do
+          -- Andreas, 2021-08-17, issue #5508.
+          -- So it happened with @msrc == Just{}@ that the file was not added to @ModuleToSource@,
+          -- only with @msrc == Nothing@ (then @findFile@ does it).
+          -- As a consequence, the file was added later, but with a file name constructed
+          -- from a module name.  As #5508 shows, this can be fatal in case-insensitive file systems.
+          -- The file name (with case variant) then no longer maps to the module name.
+          -- To prevent this, we register the connection in @ModuleToSource@ here,
+          -- where we have the correct spelling of the file name.
+          let file = srcOrigin src
+          modifyTCLens stModuleToSource $ Map.insert x (srcFilePath file)
+          pure file
+      reportSLn "import.iface" 15 $ List.intercalate "\n" $ map ("  " ++)
+        [ "module: " ++ prettyShow x
+        , "file:   " ++ prettyShow file
+        ]
 
       reportSLn "import.iface" 10 $ "  Check for cycle"
       checkForImportCycle
 
-      uptodate <- Bench.billTo [Bench.Import] $ do
-        ignore <- ignoreInterfaces
-        cached <- runMaybeT $ isCached x file
-          -- If it's cached ignoreInterfaces has no effect;
-          -- to avoid typechecking a file more than once.
-        sourceH <- liftIO $ hashFile file
-        ifaceH  <-
-          case cached of
-            Nothing -> fmap fst <$> getInterfaceFileHashes (filePath $ toIFile file)
-            Just i  -> return $ Just $ iSourceHash i
-        let unchanged = Just sourceH == ifaceH
-        return $ unchanged && (not ignore || isJust cached)
+      -- -- Andreas, 2014-10-20 AIM XX:
+      -- -- Always retype-check the main file to get the iInsideScope
+      -- -- which is no longer serialized.
+      -- let maySkip = isMain == NotMainInterface
+      -- Andreas, 2015-07-13: Serialize iInsideScope again.
+      -- Andreas, 2020-05-13 issue #4647: don't skip if reload because of top-level command
+      stored <- runExceptT $ Bench.billTo [Bench.Import] $ do
+        getStoredInterface x file msrc
 
-      reportSLn "import.iface" 5 $
-        "  " ++ prettyShow x ++ " is " ++
-        (if uptodate then "" else "not ") ++ "up-to-date."
+      let recheck = \reason -> do
+            reportSLn "import.iface" 5 $ concat ["  ", prettyShow x, " is not up-to-date because ", reason, "."]
+            setCommandLineOptions . stPersistentOptions . stPersistentState =<< getTC
+            case isMain of
+              MainInterface _ -> createInterface x file isMain msrc
+              NotMainInterface -> createInterfaceIsolated x file msrc
 
-      (stateChangesIncluded, (i, wt)) <- do
-        -- -- Andreas, 2014-10-20 AIM XX:
-        -- -- Always retype-check the main file to get the iInsideScope
-        -- -- which is no longer serialized.
-        -- let maySkip = isMain == NotMainInterface
-        -- Andreas, 2015-07-13: Serialize iInsideScope again.
-        let maySkip = True
+      either recheck pure stored
 
-        if uptodate && maySkip
-          then getStoredInterface x file isMain
-          else typeCheck          x file isMain
+-- | Check if the options used for checking an imported module are
+--   compatible with the current options. Raises Non-fatal errors if
+--   not.
+checkOptionsCompatible ::
+  PragmaOptions -> PragmaOptions -> TopLevelModuleName -> TCM Bool
+checkOptionsCompatible current imported importedModule = flip execStateT True $ do
+  reportSDoc "import.iface.options" 5 $ P.nest 2 $ "current options  =" P.<+> showOptions current
+  reportSDoc "import.iface.options" 5 $ P.nest 2 $ "imported options =" P.<+> showOptions imported
+  forM_ infectiveCoinfectiveOptions $ \opt -> do
+    unless (icOptionOK opt current imported) $ do
+      put False
+      warning $
+        (case icOptionKind opt of
+           Infective   -> InfectiveImport
+           Coinfective -> CoInfectiveImport)
+        (icOptionWarning opt importedModule)
+  where
+  showOptions opts =
+    P.prettyList $
+    map (\opt -> (P.text (icOptionDescription opt) <> ": ") P.<+>
+                 P.pretty (icOptionActive opt opts))
+      infectiveCoinfectiveOptions
 
-      -- Ensure that the given module name matches the one in the file.
-      let topLevelName = toTopLevelModuleName $ iModuleName i
-      unless (topLevelName == x) $ do
-        -- Andreas, 2014-03-27 This check is now done in the scope checker.
-        -- checkModuleName topLevelName file
-        typeError $ OverlappingProjects file topLevelName x
+-- | Compare options and return collected warnings.
+-- | Returns `Nothing` if warning collection was skipped.
 
-      visited <- isVisited x
-      reportSLn "import.iface" 5 $ if visited then "  We've been here. Don't merge."
-                                   else "  New module. Let's check it out."
-      unless (visited || stateChangesIncluded) $ do
-        mergeInterface i
-        Bench.billTo [Bench.Highlighting] $
-          ifTopLevelAndHighlightingLevelIs NonInteractive $
-            highlightFromInterface i file
-
-      stCurrentModule `setTCLens` Just (iModuleName i)
-
-      -- Interfaces are not stored if we are only scope-checking, or
-      -- if any warnings were encountered.
-      case (isMain, wt) of
-        (MainInterface ScopeCheck, _) -> return ()
-        (_, SomeWarnings w)           -> return ()
-        _                             -> storeDecodedModule i
-
-      return (i, wt)
-
--- | Check whether interface file exists and is in cache
---   in the correct version (as testified by the interface file hash).
-
-isCached
-  :: C.TopLevelModuleName
-     -- ^ Module name of file we process.
-  -> AbsolutePath
-     -- ^ File we process.
-  -> MaybeT TCM Interface
-
-isCached x file = do
-  let ifile = filePath $ toIFile file
-
-  -- Make sure the file exists in the case sensitive spelling.
-  guardM $ liftIO $ doesFileExistCaseSensitive ifile
-
-  -- Check that we have cached the module.
-  mi <- MaybeT $ getDecodedModule x
-
-  -- Check that the interface file exists and return its hash.
-  h  <- MaybeT $ fmap snd <$> getInterfaceFileHashes ifile
-
-  -- Make sure the hashes match.
-  guard $ iFullHash mi == h
-
-  return mi
+getOptionsCompatibilityWarnings :: MainInterface -> Bool -> PragmaOptions -> Interface -> TCM (Maybe [TCWarning])
+getOptionsCompatibilityWarnings isMain isPrim currentOptions i = runMaybeT $ exceptToMaybeT $ do
+  -- We're just dropping these reasons-for-skipping messages for now.
+  -- They weren't logged before, but they're nice for documenting the early returns.
+  when isPrim $
+    throwError "Options consistency checking disabled for always-available primitive module"
+  whenM (lift $ checkOptionsCompatible currentOptions (iOptionsUsed i)
+                  (iTopLevelModuleName i)) $
+    throwError "No warnings to collect because options were compatible"
+  lift $ getAllWarnings' isMain ErrorWarnings
 
 -- | Try to get the interface from interface file or cache.
 
 getStoredInterface
-  :: C.TopLevelModuleName
+  :: TopLevelModuleName
      -- ^ Module name of file we process.
-  -> AbsolutePath
+  -> SourceFile
      -- ^ File we process.
-  -> MainInterface
-  -> TCM (Bool, (Interface, MaybeWarnings))
-     -- ^ @Bool@ is: do we have to merge the interface?
-getStoredInterface x file isMain = do
-  -- If something goes wrong (interface outdated etc.)
-  -- we revert to fresh type checking.
-  let fallback = typeCheck x file isMain
+  -> Maybe Source
+  -> ExceptT String TCM ModuleInfo
+getStoredInterface x file msrc = do
+  -- Check whether interface file exists and is in cache
+  --  in the correct version (as testified by the interface file hash).
+  --
+  -- This is a lazy action which may be skipped if there is no cached interface
+  -- and we're ignoring interface files for some reason.
+  let getIFileHashesET = do
+        -- Check that the interface file exists and return its hash.
+        ifile <- maybeToExceptT "the interface file could not be found" $ MaybeT $
+          findInterfaceFile' file
+
+        -- Check that the interface file exists and return its hash.
+        hashes <- maybeToExceptT "the interface file hash could not be read" $ MaybeT $ liftIO $
+          getInterfaceFileHashes ifile
+
+        return (ifile, hashes)
 
   -- Examine the hash of the interface file. If it is different from the
   -- stored version (in stDecodedModules), or if there is no stored version,
   -- read and decode it. Otherwise use the stored version.
-  let ifile = filePath $ toIFile file
-  h <- fmap snd <$> getInterfaceFileHashes ifile
-  mm <- getDecodedModule x
-  (cached, mi) <- Bench.billTo [Bench.Deserialization] $ case mm of
-    Just mi ->
-      if Just (iFullHash mi) /= h
-      then do
-        dropDecodedModule x
-        reportSLn "import.iface" 50 $ "  cached hash = " ++ show (iFullHash mi)
-        reportSLn "import.iface" 50 $ "  stored hash = " ++ show h
-        reportSLn "import.iface" 5 $ "  file is newer, re-reading " ++ ifile
-        (False,) <$> readInterface ifile
-      else do
-        reportSLn "import.iface" 5 $ "  using stored version of " ++ ifile
-        return (True, Just mi)
-    Nothing -> do
-      reportSLn "import.iface" 5 $ "  no stored version, reading " ++ ifile
-      (False,) <$> readInterface ifile
+  --
+  -- This is a lazy action which may be skipped if the cached or on-disk interface
+  -- is invalid, missing, or skipped for some other reason.
+  let checkSourceHashET ifaceH = do
+        sourceH <- case msrc of
+                    Nothing -> liftIO $ hashTextFile (srcFilePath file)
+                    Just src -> return $ hashText (srcText src)
+
+        unless (sourceH == ifaceH) $
+          throwError $ concat
+            [ "the source hash (", show sourceH, ")"
+            , " does not match the source hash for the interface (", show ifaceH, ")"
+            ]
+
+        reportSLn "import.iface" 5 $ concat ["  ", prettyShow x, " is up-to-date."]
+
+  -- Check if we have cached the module.
+  cachedE <- runExceptT $ maybeToExceptT "the interface has not been decoded" $ MaybeT $
+      lift $ getDecodedModule x
+
+  case cachedE of
+    -- If it's cached ignoreInterfaces has no effect;
+    -- to avoid typechecking a file more than once.
+    Right mi -> do
+      (ifile, hashes) <- getIFileHashesET
+
+      let ifp = filePath $ intFilePath ifile
+      let i = miInterface mi
+
+      -- Make sure the hashes match.
+      let cachedIfaceHash = iFullHash i
+      let fileIfaceHash = snd hashes
+      unless (cachedIfaceHash == fileIfaceHash) $ do
+        lift $ dropDecodedModule x
+        reportSLn "import.iface" 50 $ "  cached hash = " ++ show cachedIfaceHash
+        reportSLn "import.iface" 50 $ "  stored hash = " ++ show fileIfaceHash
+        reportSLn "import.iface" 5 $ "  file is newer, re-reading " ++ ifp
+        throwError $ concat
+          [ "the cached interface hash (", show cachedIfaceHash, ")"
+          , " does not match interface file (", show fileIfaceHash, ")"
+          ]
+
+      Bench.billTo [Bench.Deserialization] $ do
+        checkSourceHashET (iSourceHash i)
+
+        reportSLn "import.iface" 5 $ "  using stored version of " ++ (filePath $ intFilePath ifile)
+        loadDecodedModule file mi
+
+    Left whyNotCached -> withExceptT (\e -> concat [whyNotCached, " and ", e]) $ do
+      whenM ignoreAllInterfaces $
+        throwError "we're ignoring all interface files"
+
+      whenM ignoreInterfaces $
+        unlessM (lift $ Lens.isBuiltinModule (filePath $ srcFilePath file)) $
+            throwError "we're ignoring non-builtin interface files"
+
+      (ifile, hashes) <- getIFileHashesET
+
+      let ifp = (filePath . intFilePath $ ifile)
+
+      Bench.billTo [Bench.Deserialization] $ do
+        checkSourceHashET (fst hashes)
+
+        reportSLn "import.iface" 5 $ "  no stored version, reading " ++ ifp
+
+        i <- maybeToExceptT "bad interface, re-type checking" $ MaybeT $
+          readInterface ifile
+
+        -- Ensure that the given module name matches the one in the file.
+        let topLevelName = iTopLevelModuleName i
+        unless (topLevelName == x) $
+          -- Andreas, 2014-03-27 This check is now done in the scope checker.
+          -- checkModuleName topLevelName file
+          lift $ typeError $ OverlappingProjects (srcFilePath file) topLevelName x
+
+        isPrimitiveModule <- lift $ Lens.isPrimitiveModule (filePath $ srcFilePath file)
+
+        lift $ chaseMsg "Loading " x $ Just ifp
+        -- print imported warnings
+        let ws = filter ((Strict.Just (Just x) ==) .
+                         fmap rangeFileName . tcWarningOrigin) $
+                 iWarnings i
+        unless (null ws) $ reportSDoc "warning" 1 $ P.vcat $ P.prettyTCM <$> ws
+
+        loadDecodedModule file $ ModuleInfo
+          { miInterface = i
+          , miWarnings = []
+          , miPrimitive = isPrimitiveModule
+          , miMode = ModuleTypeChecked
+          }
+
+
+loadDecodedModule
+  :: SourceFile
+     -- ^ File we process.
+  -> ModuleInfo
+  -> ExceptT String TCM ModuleInfo
+loadDecodedModule file mi = do
+  let fp = filePath $ srcFilePath file
+  let i = miInterface mi
 
   -- Check that it's the right version
-  case mi of
-    Nothing       -> do
-      reportSLn "import.iface" 5 $ "  bad interface, re-type checking"
-      fallback
-    Just i        -> do
-      reportSLn "import.iface" 5 $ "  imports: " ++ show (iImportedModules i)
+  reportSLn "import.iface" 5 $ "  imports: " ++ prettyShow (iImportedModules i)
 
-      hs <- map iFullHash <$> mapM getInterface (map fst $ iImportedModules i)
+  -- We set the pragma options of the skipped file here, so that
+  -- we can check that they are compatible with those of the
+  -- imported modules. Also, if the top-level file is skipped we
+  -- want the pragmas to apply to interactive commands in the UI.
+  -- Jesper, 2021-04-18: Check for changed options in library files!
+  -- (see #5250)
+  libOptions <- lift $ getLibraryOptions
+    (srcFilePath file)
+    (iTopLevelModuleName i)
+  lift $ mapM_ setOptionsFromPragma (libOptions ++ iFilePragmaOptions i)
 
-      -- If any of the imports are newer we need to retype check
-      if hs /= map snd (iImportedModules i)
-        then do
-          -- liftIO close -- Close the interface file. See above.
-          fallback
-        else do
-          unless cached $ do
-            chaseMsg "Loading " x $ Just ifile
-            -- print imported warnings
-            let ws = filter ((Strict.Just file ==) . tcWarningOrigin) (iWarnings i)
-            unless (null ws) $ reportSDoc "warning" 1 $ P.vcat $ P.prettyTCM <$> ws
+  -- Check that options that matter haven't changed compared to
+  -- current options (issue #2487)
+  unlessM (lift $ Lens.isBuiltinModule fp) $ do
+    current <- useTC stPragmaOptions
+    when (recheckBecausePragmaOptionsChanged (iOptionsUsed i) current) $
+      throwError "options changed"
 
-          -- We set the pragma options of the skipped file here,
-          -- because if the top-level file is skipped we want the
-          -- pragmas to apply to interactive commands in the UI.
-          mapM_ setOptionsFromPragma (iPragmaOptions i)
-          return (False, (i, NoWarnings))
+  -- If any of the imports are newer we need to retype check
+  badHashMessages <- fmap lefts $ forM (iImportedModules i) $ \(impName, impHash) -> runExceptT $ do
+    reportSLn "import.iface" 30 $ concat ["Checking that module hash of import ", prettyShow impName, " matches ", prettyShow impHash ]
+    latestImpHash <- lift $ lift $ setCurrentRange impName $ moduleHash impName
+    reportSLn "import.iface" 30 $ concat ["Done checking module hash of import ", prettyShow impName]
+    when (impHash /= latestImpHash) $
+      throwError $ concat
+        [ "module hash for imported module ", prettyShow impName, " is out of date"
+        , " (import cached=", prettyShow impHash, ", latest=", prettyShow latestImpHash, ")"
+        ]
+
+  unlessNull badHashMessages (throwError . unlines)
+
+  reportSLn "import.iface" 5 "  New module. Let's check it out."
+  lift $ mergeInterface i
+  Bench.billTo [Bench.Highlighting] $
+    lift $ ifTopLevelAndHighlightingLevelIs NonInteractive $
+      highlightFromInterface i file
+
+  return mi
 
 -- | Run the type checker on a file and create an interface.
 --
@@ -464,63 +752,48 @@ getStoredInterface x file isMain = do
 --   we do it in a fresh state, suitably initialize,
 --   in order to forget some state changes after successful type checking.
 
-typeCheck
-  :: C.TopLevelModuleName
+createInterfaceIsolated
+  :: TopLevelModuleName
      -- ^ Module name of file we process.
-  -> AbsolutePath
+  -> SourceFile
      -- ^ File we process.
-  -> MainInterface
-  -> TCM (Bool, (Interface, MaybeWarnings))
-     -- ^ @Bool@ is: do we have to merge the interface?
-typeCheck x file isMain = do
-  unless (includeStateChanges isMain) cleanCachedLog
-  let checkMsg = case isMain of
-                   MainInterface ScopeCheck -> "Reading "
-                   _                        -> "Checking"
-      withMsgs = bracket_
-       (chaseMsg checkMsg x $ Just $ filePath file)
-       (const $ do ws <- getAllWarnings' AllWarnings RespectFlags
-                   let (we, wa) = classifyWarnings ws
-                   let wa' = filter ((Strict.Just file ==) . tcWarningOrigin) wa
-                   unless (null wa') $
-                     reportSDoc "warning" 1 $ P.vcat $ P.prettyTCM <$> wa'
-                   when (null we) $ chaseMsg "Finished" x Nothing)
+  -> Maybe Source
+     -- ^ Optional: the source code and some information about the source code.
+  -> TCM ModuleInfo
+createInterfaceIsolated x file msrc = do
+      cleanCachedLog
 
-  -- Do the type checking.
-
-  case isMain of
-    MainInterface _ -> do
-      r <- withMsgs $ createInterface file x isMain
-      return (True, r)
-
-    NotMainInterface -> do
-      ms       <- getImportPath
-      nesting  <- asksTC envModuleNestingLevel
-      range    <- asksTC envRange
-      call     <- asksTC envCall
-      mf       <- useTC stModuleToSource
-      vs       <- getVisitedModules
-      ds       <- getDecodedModules
-      opts     <- stPersistentOptions . stPersistentState <$> getTC
-      isig     <- useTC stImports
-      ibuiltin <- useTC stImportedBuiltins
-      display  <- useTC stImportsDisplayForms
-      userwarn <- useTC stImportedUserWarnings
+      ms          <- getImportPath
+      range       <- asksTC envRange
+      call        <- asksTC envCall
+      mf          <- useTC stModuleToSource
+      vs          <- getVisitedModules
+      ds          <- getDecodedModules
+      opts        <- stPersistentOptions . stPersistentState <$> getTC
+      isig        <- useTC stImports
+      metas       <- useTC stImportedMetaStore
+      ibuiltin    <- useTC stImportedBuiltins
+      display     <- useTC stImportsDisplayForms
+      userwarn    <- useTC stImportedUserWarnings
+      partialdefs <- useTC stImportedPartialDefs
       ipatsyns <- getPatternSynImports
       ho       <- getInteractionOutputCallback
       -- Every interface is treated in isolation. Note: Some changes to
       -- the persistent state may not be preserved if an error other
       -- than a type error or an IO exception is encountered in an
       -- imported module.
-      r <- noCacheForImportedModule $
+      (mi, newModToSource, newDecodedModules) <- (either throwError pure =<<) $
+           withoutCache $
+           -- The cache should not be used for an imported module, and it
+           -- should be restored after the module has been type-checked
            freshTCM $
              withImportPath ms $
-             localTC (\e -> e { envModuleNestingLevel = nesting
+             localTC (\e -> e
                               -- Andreas, 2014-08-18:
                               -- Preserve the range of import statement
                               -- for reporting termination errors in
                               -- imported modules:
-                            , envRange              = range
+                            { envRange              = range
                             , envCall               = call
                             }) $ do
                setDecodedModules ds
@@ -528,68 +801,70 @@ typeCheck x file isMain = do
                setInteractionOutputCallback ho
                stModuleToSource `setTCLens` mf
                setVisitedModules vs
-               addImportedThings isig ibuiltin ipatsyns display userwarn []
+               addImportedThings isig metas ibuiltin ipatsyns display
+                 userwarn partialdefs []
 
-               r  <- withMsgs $ createInterface file x isMain
-               mf <- useTC stModuleToSource
-               ds <- getDecodedModules
-               return (r, do
-                  stModuleToSource `setTCLens` mf
-                  setDecodedModules ds
-                  case r of
-                    (i, NoWarnings) -> storeDecodedModule i
-                    _               -> return ()
-                  )
+               r  <- createInterface x file NotMainInterface msrc
+               mf' <- useTC stModuleToSource
+               ds' <- getDecodedModules
+               return (r, mf', ds')
 
-      case r of
-          Left err          -> throwError err
-          Right (r, update) -> do
-            update
-            case r of
-              (_, NoWarnings) ->
-                -- We skip the file which has just been type-checked to
-                -- be able to forget some of the local state from
-                -- checking the module.
-                -- Note that this doesn't actually read the interface
-                -- file, only the cached interface. (This comment is not
-                -- correct, see
-                -- test/Fail/customised/NestedProjectRoots.err.)
-                getStoredInterface x file isMain
-              _ -> return (False, r)
+      stModuleToSource `setTCLens` newModToSource
+      setDecodedModules newDecodedModules
+
+      -- We skip the file which has just been type-checked to
+      -- be able to forget some of the local state from
+      -- checking the module.
+      -- Note that this doesn't actually read the interface
+      -- file, only the cached interface. (This comment is not
+      -- correct, see
+      -- test/Fail/customised/NestedProjectRoots.err.)
+      validated <- runExceptT $ loadDecodedModule file mi
+
+      -- NOTE: This attempts to type-check FOREVER if for some
+      -- reason it continually fails to validate interface.
+      let recheckOnError = \msg -> do
+            reportSLn "import.iface" 1 $ "Failed to validate just-loaded interface: " ++ msg
+            createInterfaceIsolated x file msrc
+
+      either recheckOnError pure validated
+
 
 -- | Formats and outputs the "Checking", "Finished" and "Loading " messages.
 
 chaseMsg
   :: String               -- ^ The prefix, like @Checking@, @Finished@, @Loading @.
-  -> C.TopLevelModuleName -- ^ The module name.
+  -> TopLevelModuleName   -- ^ The module name.
   -> Maybe String         -- ^ Optionally: the file name.
   -> TCM ()
 chaseMsg kind x file = do
-  indentation <- (`replicate` ' ') <$> asksTC envModuleNestingLevel
+  indentation <- (`replicate` ' ') <$> asksTC (pred . length . envImportPath)
   let maybeFile = caseMaybe file "." $ \ f -> " (" ++ f ++ ")."
       vLvl | kind == "Checking" = 1
            | otherwise          = 2
-  reportSLn "import.chase" vLvl $ concat $
+  reportSLn "import.chase" vLvl $ concat
     [ indentation, kind, " ", prettyShow x, maybeFile ]
-
 
 -- | Print the highlighting information contained in the given interface.
 
 highlightFromInterface
   :: Interface
-  -> AbsolutePath
+  -> SourceFile
      -- ^ The corresponding file.
   -> TCM ()
 highlightFromInterface i file = do
   reportSLn "import.iface" 5 $
-    "Generating syntax info for " ++ filePath file ++
+    "Generating syntax info for " ++ filePath (srcFilePath file) ++
     " (read from interface)."
   printHighlightingInfo KeepHighlighting (iHighlighting i)
 
-readInterface :: FilePath -> TCM (Maybe Interface)
+-- | Read interface file corresponding to a module.
+
+readInterface :: InterfaceFile -> TCM (Maybe Interface)
 readInterface file = do
+    let ifp = filePath $ intFilePath file
     -- Decode the interface file
-    (s, close) <- liftIO $ readBinaryFile' file
+    (s, close) <- liftIO $ readBinaryFile' ifp
     do  mi <- liftIO . E.evaluate =<< decodeInterface s
 
         -- Close the file. Note
@@ -605,19 +880,22 @@ readInterface file = do
   -- Catch exceptions
   `catchError` handler
   where
-    handler e = case e of
+    handler = \case
       IOException _ _ e -> do
         reportSLn "" 0 $ "IO exception: " ++ show e
         return Nothing   -- Work-around for file locking bug.
                          -- TODO: What does this refer to? Please
                          -- document.
-      _ -> throwError e
+      e -> throwError e
 
 -- | Writes the given interface to the given file.
+--
+-- The written interface is decoded and returned.
 
-writeInterface :: FilePath -> Interface -> TCM ()
-writeInterface file i = do
-    reportSLn "import.iface.write" 5  $ "Writing interface file " ++ file ++ "."
+writeInterface :: AbsolutePath -> Interface -> TCM Interface
+writeInterface file i = let fp = filePath file in do
+    reportSLn "import.iface.write" 5  $
+      "Writing interface file " ++ fp ++ "."
     -- Andreas, 2015-07-13
     -- After QName memoization (AIM XXI), scope serialization might be cheap enough.
     -- -- Andreas, Makoto, 2014-10-18 AIM XX:
@@ -625,22 +903,25 @@ writeInterface file i = do
     -- i <- return $
     --   i { iInsideScope  = emptyScopeInfo
     --     }
-    -- Andreas, 2016-02-02 this causes issue #1804, so don't do it:
-    -- i <- return $
-    --   i { iInsideScope  = removePrivates $ iInsideScope i
-    --     }
-    encodeFile file i
-    reportSLn "import.iface.write" 5 $ "Wrote interface file."
-    reportSLn "import.iface.write" 50 $ "  hash = " ++ show (iFullHash i) ++ ""
+    -- [Old: Andreas, 2016-02-02 this causes issue #1804, so don't do it:]
+    -- Andreas, 2020-05-13, #1804, #4647: removed private declarations
+    -- only when we actually write the interface.
+    let filteredIface = i { iInsideScope  = withoutPrivates $ iInsideScope i }
+    reportSLn "import.iface.write" 50 $
+      "Writing interface file with hash " ++ show (iFullHash filteredIface) ++ "."
+    encodedIface <- encodeFile fp filteredIface
+    reportSLn "import.iface.write" 5 "Wrote interface file."
+#if __GLASGOW_HASKELL__ >= 804
+    fromMaybe __IMPOSSIBLE__ <$> (Bench.billTo [Bench.Deserialization] (decode encodedIface))
+#else
+    return filteredIface
+#endif
   `catchError` \e -> do
     reportSLn "" 1 $
-      "Failed to write interface " ++ file ++ "."
+      "Failed to write interface " ++ fp ++ "."
     liftIO $
-      whenM (doesFileExist file) $ removeFile file
+      whenM (doesFileExist fp) $ removeFile fp
     throwError e
-
-removePrivates :: ScopeInfo -> ScopeInfo
-removePrivates si = si { scopeModules = restrictPrivate <$> scopeModules si }
 
 -- | Tries to type check a module and write out its interface. The
 -- function only writes out an interface file if it does not encounter
@@ -650,55 +931,83 @@ removePrivates si = si { scopeModules = restrictPrivate <$> scopeModules si }
 -- information.
 
 createInterface
-  :: AbsolutePath          -- ^ The file to type check.
-  -> C.TopLevelModuleName  -- ^ The expected module name.
-  -> MainInterface
-  -> TCM (Interface, MaybeWarnings)
-createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
-  localTC (\e -> e { envCurrentPath = Just file }) $ do
-    modFile       <- useTC stModuleToSource
-    fileTokenInfo <- Bench.billTo [Bench.Highlighting] $
-                       generateTokenInfo file
-    stTokens `setTCLens` fileTokenInfo
+  :: TopLevelModuleName    -- ^ The expected module name.
+  -> SourceFile            -- ^ The file to type check.
+  -> MainInterface         -- ^ Are we dealing with the main module?
+  -> Maybe Source      -- ^ Optional information about the source code.
+  -> TCM ModuleInfo
+createInterface mname file isMain msrc = do
+  let x = mname
+  let fp = filePath $ srcFilePath file
+  let checkMsg = case isMain of
+                   MainInterface ScopeCheck -> "Reading "
+                   _                        -> "Checking"
+      withMsgs = bracket_
+       (chaseMsg checkMsg x $ Just fp)
+       (const $ do ws <- getAllWarnings AllWarnings
+                   let classified = classifyWarnings ws
+                   let wa' = filter ((Strict.Just (Just mname) ==) .
+                                     fmap rangeFileName . tcWarningOrigin) $
+                             tcWarnings classified
+                   unless (null wa') $
+                     reportSDoc "warning" 1 $ P.vcat $ P.prettyTCM <$> wa'
+                   when (null (nonFatalErrors classified)) $ chaseMsg "Finished" x Nothing)
+
+  withMsgs $
+    Bench.billTo [Bench.TopModule mname] $
+    localTC (\e -> e { envCurrentPath = Just (srcFilePath file) }) $ do
+
+    let onlyScope = isMain == MainInterface ScopeCheck
 
     reportSLn "import.iface.create" 5 $
       "Creating interface for " ++ prettyShow mname ++ "."
     verboseS "import.iface.create" 10 $ do
-      visited <- Map.keys <$> getVisitedModules
-      reportSLn "import.iface.create" 10 $
-        "  visited: " ++ List.intercalate ", " (map prettyShow visited)
+      visited <- prettyShow <$> getPrettyVisitedModules
+      reportSLn "import.iface.create" 10 $ "  visited: " ++ visited
 
-    -- Parsing.
-    (pragmas, top) <- Bench.billTo [Bench.Parsing] $
-      runPM $ parseFile' moduleParser file
+    src <- maybe (parseSource file) pure msrc
 
-    pragmas <- concat <$> concreteToAbstract_ pragmas
-               -- identity for top-level pragmas at the moment
-    let getOptions (A.OptionsPragma opts) = Just opts
-        getOptions _                      = Nothing
-        options = mapMaybe getOptions pragmas
-    mapM_ setOptionsFromPragma options
+    let srcPath = srcFilePath $ srcOrigin src
 
+    fileTokenInfo <- Bench.billTo [Bench.Highlighting] $
+      generateTokenInfoFromSource
+        (let !top = srcModuleName src in
+         mkRangeFile srcPath (Just top))
+        (TL.unpack $ srcText src)
+    stTokens `modifyTCLens` (fileTokenInfo <>)
+
+    setOptionsFromSourcePragmas src
+    checkCohesionAttributes (srcCohesion src)
+    syntactic <- optSyntacticEquality <$> pragmaOptions
+    localTC (\env -> env { envSyntacticEqualityFuel = syntactic }) $ do
+
+    verboseS "import.iface.create" 15 $ do
+      nestingLevel      <- asksTC (pred . length . envImportPath)
+      highlightingLevel <- asksTC envHighlightingLevel
+      reportSLn "import.iface.create" 15 $ unlines
+        [ "  nesting      level: " ++ show nestingLevel
+        , "  highlighting level: " ++ show highlightingLevel
+        ]
 
     -- Scope checking.
-    reportSLn "import.iface.create" 7 $ "Starting scope checking."
-    topLevel <- Bench.billTo [Bench.Scoping] $
-      concreteToAbstract_ (TopLevel file mname top)
-    reportSLn "import.iface.create" 7 $ "Finished scope checking."
+    reportSLn "import.iface.create" 7 "Starting scope checking."
+    topLevel <- Bench.billTo [Bench.Scoping] $ do
+      let topDecls = C.modDecls $ srcModule src
+      concreteToAbstract_ (TopLevel srcPath mname topDecls)
+    reportSLn "import.iface.create" 7 "Finished scope checking."
 
     let ds    = topLevelDecls topLevel
         scope = topLevelScope topLevel
 
     -- Highlighting from scope checker.
-    reportSLn "import.iface.create" 7 $ "Starting highlighting from scope."
+    reportSLn "import.iface.create" 7 "Starting highlighting from scope."
     Bench.billTo [Bench.Highlighting] $ do
       -- Generate and print approximate syntax highlighting info.
       ifTopLevelAndHighlightingLevelIs NonInteractive $
         printHighlightingInfo KeepHighlighting fileTokenInfo
-      let onlyScope = isMain == MainInterface ScopeCheck
       ifTopLevelAndHighlightingLevelIsOr NonInteractive onlyScope $
         mapM_ (\ d -> generateAndPrintSyntaxInfo d Partial onlyScope) ds
-    reportSLn "import.iface.create" 7 $ "Finished highlighting from scope."
+    reportSLn "import.iface.create" 7 "Finished highlighting from scope."
 
 
     -- Type checking.
@@ -719,14 +1028,14 @@ createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
         cleanCachedLog
     writeToCurrentLog $ Pragmas opts
 
-    case isMain of
-      MainInterface ScopeCheck -> do
-        reportSLn "import.iface.create" 7 $ "Skipping type checking."
+    if onlyScope
+      then do
+        reportSLn "import.iface.create" 7 "Skipping type checking."
         cacheCurrentLog
-      _ -> do
-        reportSLn "import.iface.create" 7 $ "Starting type checking."
+      else do
+        reportSLn "import.iface.create" 7 "Starting type checking."
         Bench.billTo [Bench.Typing] $ mapM_ checkDeclCached ds `finally_` cacheCurrentLog
-        reportSLn "import.iface.create" 7 $ "Finished type checking."
+        reportSLn "import.iface.create" 7 "Finished type checking."
 
     -- Ulf, 2013-11-09: Since we're rethrowing the error, leave it up to the
     -- code that handles that error to reset the state.
@@ -739,12 +1048,12 @@ createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
     unfreezeMetas
 
     -- Profiling: Count number of metas.
-    verboseS "profile.metas" 10 $ do
-      MetaId n <- fresh
-      tickN "metas" (fromIntegral n)
+    whenProfile Profile.Metas $ do
+      m <- fresh
+      tickN "metas" (fromIntegral (metaId m))
 
     -- Highlighting from type checker.
-    reportSLn "import.iface.create" 7 $ "Starting highlighting from type info."
+    reportSLn "import.iface.create" 7 "Starting highlighting from type info."
     Bench.billTo [Bench.Highlighting] $ do
 
       -- Move any remaining token highlighting to stSyntaxInfo.
@@ -754,20 +1063,21 @@ createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
       stTokens `setTCLens` mempty
 
       -- Grabbing warnings and unsolved metas to highlight them
-      warnings <- getAllWarnings' AllWarnings RespectFlags
+      warnings <- getAllWarnings AllWarnings
       unless (null warnings) $ reportSDoc "import.iface.create" 20 $
-        P.text "collected warnings: " P.<> prettyTCM warnings
-      unsolved <- getAllUnsolved
+        "collected warnings: " <> prettyTCM warnings
+      unsolved <- getAllUnsolvedWarnings
       unless (null unsolved) $ reportSDoc "import.iface.create" 20 $
-        P.text "collected unsolved: " P.<> prettyTCM unsolved
-      let warningInfo = compress $ foldMap warningHighlighting $ unsolved ++ warnings
+        "collected unsolved: " <> prettyTCM unsolved
+      let warningInfo =
+            convert $ foldMap warningHighlighting $ unsolved ++ warnings
 
       stSyntaxInfo `modifyTCLens` \inf -> (inf `mappend` toks) `mappend` warningInfo
 
       whenM (optGenerateVimFile <$> commandLineOptions) $
         -- Generate Vim file.
-        withScope_ scope $ generateVimFile $ filePath file
-    reportSLn "import.iface.create" 7 $ "Finished highlighting from type info."
+        withScope_ scope $ generateVimFile $ filePath $ srcPath
+    reportSLn "import.iface.create" 7 "Finished highlighting from type info."
 
     setScope scope
     reportSLn "scope.top" 50 $ "SCOPE " ++ show scope
@@ -778,10 +1088,9 @@ createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
     openMetas           <- getOpenMetas
     unless (null openMetas) $ do
       reportSLn "import.metas" 10 "We have unsolved metas."
-      reportSLn "import.metas" 10 . unlines =<< showOpenMetas
+      reportSLn "import.metas" 10 =<< showGoals =<< getGoals
 
-    ifTopLevelAndHighlightingLevelIs NonInteractive $
-      printUnsolvedInfo
+    ifTopLevelAndHighlightingLevelIs NonInteractive printUnsolvedInfo
 
     -- Andreas, 2016-08-03, issue #964
     -- When open metas are allowed,
@@ -789,122 +1098,89 @@ createInterface file mname isMain = Bench.billTo [Bench.TopModule mname] $
     -- This will enable serialization.
     -- savedMetaStore <- useTC stMetaStore
     unless (includeStateChanges isMain) $
+      -- Andreas, 2018-11-15, re issue #3393:
+      -- We do not get here when checking the main module
+      -- (then includeStateChanges is True).
       whenM (optAllowUnsolved <$> pragmaOptions) $ do
-        withCurrentModule (scopeCurrent scope) $
-          openMetasToPostulates
+        reportSLn "import.iface.create" 7 "Turning unsolved metas (if any) into postulates."
+        withCurrentModule (scope ^. scopeCurrent) openMetasToPostulates
         -- Clear constraints as they might refer to what
         -- they think are open metas.
         stAwakeConstraints    `setTCLens` []
         stSleepingConstraints `setTCLens` []
 
     -- Serialization.
-    reportSLn "import.iface.create" 7 $ "Starting serialization."
-    i <- Bench.billTo [Bench.Serialization, Bench.BuildInterface] $ do
-      buildInterface file topLevel options
+    reportSLn "import.iface.create" 7 "Starting serialization."
+    i <- Bench.billTo [Bench.Serialization, Bench.BuildInterface] $
+      buildInterface src topLevel
 
-    reportSLn "tc.top" 101 $ unlines $
+    reportS "tc.top" 101 $
       "Signature:" :
       [ unlines
-          [ prettyShow x
+          [ prettyShow q
           , "  type: " ++ show (defType def)
           , "  def:  " ++ show cc
           ]
-      | (x, def) <- HMap.toList $ iSignature i ^. sigDefinitions,
+      | (q, def) <- HMap.toList $ iSignature i ^. sigDefinitions,
         Function{ funCompiled = cc } <- [theDef def]
       ]
-    reportSLn "import.iface.create" 7 $ "Finished serialization."
+    reportSLn "import.iface.create" 7 "Finished serialization."
 
-    mallWarnings <- getAllWarnings ErrorWarnings
-                      $ case isMain of
-                          MainInterface _  -> IgnoreFlags
-                          NotMainInterface -> RespectFlags
+    mallWarnings <- getAllWarnings' isMain ErrorWarnings
 
-    reportSLn "import.iface.create" 7 $ "Considering writing to interface file."
-    case (mallWarnings, isMain) of
-      (SomeWarnings allWarnings, _) -> return ()
-      (_, MainInterface ScopeCheck) -> return ()
-      _ -> Bench.billTo [Bench.Serialization] $ do
+    reportSLn "import.iface.create" 7 "Considering writing to interface file."
+    finalIface <- constructIScope <$> case (mallWarnings, isMain) of
+      (_:_, _) -> do
+        -- Andreas, 2018-11-15, re issue #3393
+        -- The following is not sufficient to fix #3393
+        -- since the replacement of metas by postulates did not happen.
+        -- -- | not (allowUnsolved && all (isUnsolvedWarning . tcWarning) allWarnings) -> do
+        reportSLn "import.iface.create" 7 "We have warnings, skipping writing interface file."
+        return i
+      ([], MainInterface ScopeCheck) -> do
+        reportSLn "import.iface.create" 7 "We are just scope-checking, skipping writing interface file."
+        return i
+      ([], _) -> Bench.billTo [Bench.Serialization] $ do
+        reportSLn "import.iface.create" 7 "Actually calling writeInterface."
         -- The file was successfully type-checked (and no warnings were
         -- encountered), so the interface should be written out.
-        let ifile = filePath $ toIFile file
-        writeInterface ifile i
-    reportSLn "import.iface.create" 7 $ "Finished (or skipped) writing to interface file."
+        ifile <- toIFile file
+        serializedIface <- writeInterface ifile i
+        reportSLn "import.iface.create" 7 "Finished writing to interface file."
+        return serializedIface
 
     -- -- Restore the open metas, as we might continue in interaction mode.
     -- Actually, we do not serialize the metas if checking the MainInterface
     -- stMetaStore `setTCLens` savedMetaStore
 
     -- Profiling: Print statistics.
-    printStatistics 30 (Just mname) =<< getStatistics
+    printStatistics (Just mname) =<< getStatistics
 
     -- Get the statistics of the current module
     -- and add it to the accumulated statistics.
     localStatistics <- getStatistics
     lensAccumStatistics `modifyTCLens` Map.unionWith (+) localStatistics
-    verboseS "profile" 1 $ do
-      reportSLn "import.iface" 5 $ "Accumulated statistics."
+    reportSLn "import.iface" 5 "Accumulated statistics."
 
-    return $ first constructIScope (i, mallWarnings)
+    isPrimitiveModule <- Lens.isPrimitiveModule (filePath srcPath)
 
--- | Collect all warnings that have accumulated in the state.
--- Depending on the argument, we either respect the flags passed
--- in by the user, or not (for instance when deciding if we are
--- writing an interface file or not)
+    return ModuleInfo
+      { miInterface = finalIface
+      , miWarnings = mallWarnings
+      , miPrimitive = isPrimitiveModule
+      , miMode = moduleCheckMode isMain
+      }
 
-getUniqueMetasRanges :: [MetaId] -> TCM [Range]
-getUniqueMetasRanges = fmap List.nub . mapM getMetaRange
+-- | Expert version of 'getAllWarnings'; if 'isMain' is a
+-- 'MainInterface', the warnings definitely include also unsolved
+-- warnings.
 
-getUnsolvedMetas :: TCM [Range]
-getUnsolvedMetas = do
-  openMetas            <- getOpenMetas
-  interactionMetas     <- getInteractionMetas
-  getUniqueMetasRanges (openMetas List.\\ interactionMetas)
+getAllWarnings' :: (MonadFail m, ReadTCState m, MonadWarning m) => MainInterface -> WhichWarnings -> m [TCWarning]
+getAllWarnings' (MainInterface _) = getAllWarningsPreserving unsolvedWarnings
+getAllWarnings' NotMainInterface  = getAllWarningsPreserving Set.empty
 
-getAllUnsolved :: TCM [TCWarning]
-getAllUnsolved = do
-  unsolvedInteractions <- getUniqueMetasRanges =<< getInteractionMetas
-  unsolvedConstraints  <- getAllConstraints
-  unsolvedMetas        <- getUnsolvedMetas
-
-  let checkNonEmpty c rs = c rs <$ guard (not $ null rs)
-
-  mapM warning_ $ catMaybes
-                [ checkNonEmpty UnsolvedInteractionMetas unsolvedInteractions
-                , checkNonEmpty UnsolvedMetaVariables    unsolvedMetas
-                , checkNonEmpty UnsolvedConstraints      unsolvedConstraints ]
-
-getAllWarnings' :: WhichWarnings -> IgnoreFlags -> TCM [TCWarning]
-getAllWarnings' ww ifs = do
-  unsolved            <- getAllUnsolved
-  collectedTCWarnings <- useTC stTCWarnings
-
-  let showWarn w = classifyWarning w <= ww &&
-                    not (null unsolved && onlyShowIfUnsolved w)
-
-  fmap (filter (showWarn . tcWarning))
-    $ applyFlagsToTCWarnings ifs $ reverse
-    $ unsolved ++ collectedTCWarnings
-
-getAllWarnings :: WhichWarnings -> IgnoreFlags -> TCM MaybeWarnings
-getAllWarnings ww ifs = do
-  allWarnings <- getAllWarnings' ww ifs
-  return $ if null allWarnings
-    -- Andreas, issue 964: not checking null interactionPoints
-    -- anymore; we want to serialize with open interaction points now!
-           then NoWarnings
-           else SomeWarnings allWarnings
-
-getAllWarningsOfTCErr :: TCErr -> TCM [TCWarning]
-getAllWarningsOfTCErr err = case err of
-  TypeError tcst cls -> case clValue cls of
-    NonFatalErrors{} -> return []
-    _ -> localTCState $ do
-      putTC tcst
-      ws <- getAllWarnings' AllWarnings RespectFlags
-      -- We filter out the unsolved(Metas/Constraints) to stay
-      -- true to the previous error messages.
-      return $ filter (not . isUnsolvedWarning . tcWarning) ws
-  _ -> return []
+-- Andreas, issue 964: not checking null interactionPoints
+-- anymore; we want to serialize with open interaction points now!
 
 -- | Reconstruct the 'iScope' (not serialized)
 --   from the 'iInsideScope' (serialized).
@@ -917,17 +1193,18 @@ constructIScope i = billToPure [ Deserialization ] $
 -- have been successfully type checked.
 
 buildInterface
-  :: AbsolutePath
+  :: Source
+     -- ^ 'Source' for the current module.
   -> TopLevelInfo
-     -- ^ 'TopLevelInfo' for the current module.
-  -> [OptionsPragma]
-     -- ^ Options set in @OPTIONS@ pragmas.
+     -- ^ 'TopLevelInfo' scope information for the current module.
   -> TCM Interface
-buildInterface file topLevel pragmas = do
+buildInterface src topLevel = do
     reportSLn "import.iface" 5 "Building interface..."
-    let m = topLevelModuleName topLevel
-    scope'  <- getScope
-    let scope = scope' { scopeCurrent = m }
+    let mname = CToA.topLevelModuleName topLevel
+        source   = srcText src
+        fileType = srcFileType src
+        defPragmas = srcDefaultPragmas src
+        filePragmas  = srcFilePragmas src
     -- Andreas, 2014-05-03: killRange did not result in significant reduction
     -- of .agdai file size, and lost a few seconds performance on library-test.
     -- Andreas, Makoto, 2014-10-18 AIM XX: repeating the experiment
@@ -938,67 +1215,77 @@ buildInterface file topLevel pragmas = do
     -- that introduced this change seems to have made Agda a bit
     -- faster and interface file sizes a bit smaller, at least for the
     -- standard library).
-    builtin <- useTC stLocalBuiltins
-    ms      <- getImports
-    mhs     <- mapM (\ m -> (m,) <$> moduleHash m) $ Set.toList ms
+    builtin     <- useTC stLocalBuiltins
+    mhs         <- mapM (\top -> (top,) <$> moduleHash top) .
+                   HSet.toList =<<
+                   useR stImportedModules
     foreignCode <- useTC stForeignCode
     -- Ulf, 2016-04-12:
     -- Non-closed display forms are not applicable outside the module anyway,
     -- and should be dead-code eliminated (#1928).
-    display <- HMap.filter (not . null) . HMap.map (filter isClosed) <$> useTC stImportsDisplayForms
+    origDisplayForms <- HMap.filter (not . null) . HMap.map (filter isClosed) <$> useTC stImportsDisplayForms
     -- TODO: Kill some ranges?
-    (display, sig) <- eliminateDeadCode display =<< getSignature
-    userwarns <- useTC stLocalUserWarnings
-    syntaxInfo <- useTC stSyntaxInfo
+    (display, sig, solvedMetas) <-
+      eliminateDeadCode builtin origDisplayForms ==<<
+        (getSignature, useR stSolvedMetaStore)
+    userwarns   <- useTC stLocalUserWarnings
+    importwarn  <- useTC stWarningOnImport
+    syntaxInfo  <- useTC stSyntaxInfo
+    optionsUsed <- useTC stPragmaOptions
+    partialDefs <- useTC stLocalPartialDefs
+
     -- Andreas, 2015-02-09 kill ranges in pattern synonyms before
     -- serialization to avoid error locations pointing to external files
-    -- when expanding a pattern synoym.
+    -- when expanding a pattern synonym.
     patsyns <- killRange <$> getPatternSyns
-    h       <- liftIO $ hashFile file
     let builtin' = Map.mapWithKey (\ x b -> (x,) . primFunName <$> b) builtin
-    warnings <- getAllWarnings' AllWarnings RespectFlags
-    reportSLn "import.iface" 7 "  instantiating all meta variables"
-    i <- instantiateFull $ Interface
-      { iSourceHash      = h
-      , iImportedModules = mhs
-      , iModuleName      = m
-      , iScope           = empty -- publicModules scope
-      , iInsideScope     = topLevelScope topLevel
-      , iSignature       = sig
-      , iDisplayForms    = display
-      , iUserWarnings    = userwarns
-      , iBuiltin         = builtin'
-      , iForeignCode     = foreignCode
-      , iHighlighting    = syntaxInfo
-      , iPragmaOptions   = pragmas
-      , iPatternSyns     = patsyns
-      , iWarnings        = warnings
-      }
+    warnings <- getAllWarnings AllWarnings
+    let i = Interface
+          { iSourceHash      = hashText source
+          , iSource          = source
+          , iFileType        = fileType
+          , iImportedModules = mhs
+          , iModuleName      = mname
+          , iTopLevelModuleName = srcModuleName src
+          , iScope           = empty -- publicModules scope
+          , iInsideScope     = topLevelScope topLevel
+          , iSignature       = sig
+          , iMetaBindings    = solvedMetas
+          , iDisplayForms    = display
+          , iUserWarnings    = userwarns
+          , iImportWarning   = importwarn
+          , iBuiltin         = builtin'
+          , iForeignCode     = foreignCode
+          , iHighlighting    = syntaxInfo
+          , iDefaultPragmaOptions = defPragmas
+          , iFilePragmaOptions    = filePragmas
+          , iOptionsUsed     = optionsUsed
+          , iPatternSyns     = patsyns
+          , iWarnings        = warnings
+          , iPartialDefs     = partialDefs
+          }
+    i <-
+      ifM (collapseDefault . optSaveMetas <$> pragmaOptions)
+        (return i)
+        (do reportSLn "import.iface" 7
+              "  instantiating all meta variables"
+            -- Note that the meta-variables in the definitions in
+            -- "sig" have already been instantiated (by
+            -- eliminateDeadCode).
+            instantiateFullExceptForDefinitions i)
     reportSLn "import.iface" 7 "  interface complete"
     return i
 
 -- | Returns (iSourceHash, iFullHash)
-getInterfaceFileHashes :: FilePath -> TCM (Maybe (Hash, Hash))
-getInterfaceFileHashes ifile = do
-  exist <- liftIO $ doesFileExist ifile
-  if not exist then return Nothing else do
-    (s, close) <- liftIO $ readBinaryFile' ifile
-    let hs = decodeHashes s
-    liftIO $ maybe 0 (uncurry (+)) hs `seq` close
-    return hs
+--   We do not need to check that the file exist because we only
+--   accept @InterfaceFile@ as an input and not arbitrary @AbsolutePath@!
+getInterfaceFileHashes :: InterfaceFile -> IO (Maybe (Hash, Hash))
+getInterfaceFileHashes fp = do
+  let ifile = filePath $ intFilePath fp
+  (s, close) <- readBinaryFile' ifile
+  let hs = decodeHashes s
+  maybe 0 (uncurry (+)) hs `seq` close
+  return hs
 
-moduleHash :: ModuleName -> TCM Hash
-moduleHash m = iFullHash <$> getInterface m
-
--- | True if the first file is newer than the second file. If a file doesn't
--- exist it is considered to be infinitely old.
-isNewerThan :: FilePath -> FilePath -> IO Bool
-isNewerThan new old = do
-    newExist <- doesFileExist new
-    oldExist <- doesFileExist old
-    if not (newExist && oldExist)
-        then return newExist
-        else do
-            newT <- getModificationTime new
-            oldT <- getModificationTime old
-            return $ newT >= oldT
+moduleHash :: TopLevelModuleName -> TCM Hash
+moduleHash m = iFullHash <$> getNonMainInterface m Nothing

@@ -1,3 +1,4 @@
+{-# OPTIONS --cubical-compatible #-}
 module Common.List where
 
 open import Agda.Builtin.List public

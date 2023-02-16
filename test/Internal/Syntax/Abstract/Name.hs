@@ -2,7 +2,7 @@
 module Internal.Syntax.Abstract.Name () where
 
 import Agda.Syntax.Abstract.Name
-import Agda.Syntax.Fixity
+import Agda.Syntax.Common
 
 import Internal.Syntax.Concrete.Name ()
 
@@ -16,8 +16,9 @@ import Test.QuickCheck
 
 instance Arbitrary Name where
   arbitrary =
-    Name <$> arbitrary <*> arbitrary <*> arbitrary
+    Name <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary
          <*> return noFixity'
+         <*> return False
 
 instance CoArbitrary Name where
   coarbitrary = coarbitrary . nameId
@@ -30,4 +31,3 @@ instance Arbitrary QName where
 
 instance CoArbitrary QName where
   coarbitrary = coarbitrary . qnameName
-

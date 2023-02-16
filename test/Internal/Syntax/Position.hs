@@ -3,24 +3,29 @@
 module Internal.Syntax.Position ( tests ) where
 
 import Agda.Syntax.Position
+import Agda.Syntax.TopLevelModuleName
 import Agda.Utils.FileName
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.List ( distinct )
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Null ( null )
 
 import Control.Monad
 
 import Data.Int
-import Data.List hiding ( null )
+import Data.List (sort)
 import Data.Set (Set)
 import qualified Data.Set as Set
+import qualified Data.Text as T
 
 import Internal.Helpers
-import Internal.Utils.FileName ()
+import Internal.Syntax.Common ()
+import Internal.Utils.FileName (rootPath)
 import Internal.Utils.Maybe.Strict ()
 
 import Prelude hiding ( null )
 
+import System.FilePath
 
 ------------------------------------------------------------------------
 -- Test suite
@@ -49,22 +54,11 @@ prop_iLength i = iLength i >= 0
 prop_startPos' :: Bool
 prop_startPos' = positionInvariant (startPos' ())
 
-prop_startPos :: Maybe AbsolutePath -> Bool
+prop_startPos :: Maybe RangeFile -> Bool
 prop_startPos = positionInvariant . startPos
 
 prop_noRange :: Bool
 prop_noRange = rangeInvariant (noRange :: Range)
-
-prop_takeI_dropI :: Interval' Integer -> Property
-prop_takeI_dropI i =
-  forAll (choose (0, toInteger $ iLength i)) $ \n ->
-    let s = genericReplicate n ' '
-        t = takeI s i
-        d = dropI s i
-    in
-    intervalInvariant t &&
-    intervalInvariant d &&
-    fuseIntervals t d == i
 
 prop_posToRange' ::
   Integer -> PositionWithoutFile -> PositionWithoutFile -> Bool
@@ -189,6 +183,34 @@ prop_rangeInSameFileAs r =
       (Range f _, Range f' _) -> f == f'
       (Range _ _, NoRange)    -> False
 
+instance Arbitrary RawTopLevelModuleName where
+  arbitrary = do
+    r     <- arbitrary
+    parts <- list1Of (T.pack <$> listOf1 (elements "AB"))
+    return $ RawTopLevelModuleName
+      { rawModuleNameRange = r
+      , rawModuleNameParts = parts
+      }
+
+instance Arbitrary TopLevelModuleName where
+  arbitrary = do
+    raw <- arbitrary
+    return $
+      unsafeTopLevelModuleName raw
+        (hashRawTopLevelModuleName raw)
+
+instance CoArbitrary TopLevelModuleName where
+  coarbitrary = coarbitrary . moduleNameId
+
+instance Arbitrary RangeFile where
+  arbitrary = do
+    top   <- arbitrary
+    extra <- take 2 . map (take 2) <$> listOf (listOf1 (elements "a1"))
+    let f = mkAbsolute $ joinPath $
+            rootPath : extra ++
+            map T.unpack (List1.toList (moduleNameParts top))
+    return $ mkRangeFile f (Just top)
+
 instance (Arbitrary a, Ord a) => Arbitrary (Interval' a) where
   arbitrary = do
     (p1, p2 :: Position' a) <- liftM2 (,) arbitrary arbitrary
@@ -205,6 +227,7 @@ instance (Ord a, Arbitrary a) => Arbitrary (Range' a) where
       | otherwise            = i1 : fuse (i2 : is)
     fuse is = is
 
+instance CoArbitrary RangeFile
 instance CoArbitrary a => CoArbitrary (Position' a)
 instance CoArbitrary a => CoArbitrary (Interval' a)
 instance CoArbitrary a => CoArbitrary (Range' a)
@@ -217,10 +240,6 @@ prop_intervalInvariant = intervalInvariant
 
 prop_rangeInvariant :: Range -> Bool
 prop_rangeInvariant = rangeInvariant
-
-instance Show (Position' Integer) where show = show . fmap Strict.Just
-instance Show (Interval' Integer) where show = show . fmap Strict.Just
-instance Show (Range'    Integer) where show = show . fmap Strict.Just
 
 ------------------------------------------------------------------------
 -- * All tests

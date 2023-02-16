@@ -1,4 +1,4 @@
-
+-- Unexpected context for generalized type #3110
 postulate
   Nat : Set
   Fin : Nat → Set
@@ -8,8 +8,8 @@ private
  module M where
 
   variable
-    {n} : Nat
-    {m} : Fin _
+    n : Nat
+    m : Fin _
 
   postulate
     Bar : Foo n m → Set
@@ -22,7 +22,7 @@ variable
   l : Foo n m
 
 before : Bar l
-before n m l = {!C-c C-e!}
+before {n} {m} {l} = {!C-c C-e!}
 
 after : Bar l
-after n m l = {!C-c C-e!}
+after {n} {m} {l} = {!C-c C-e!}

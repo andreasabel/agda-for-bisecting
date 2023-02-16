@@ -1,54 +1,67 @@
 
-module Agda.TypeChecking.Empty (isEmptyType, isEmptyTel) where
+module Agda.TypeChecking.Empty
+  ( isEmptyType
+  , isEmptyTel
+  , ensureEmptyType
+  , checkEmptyTel
+  ) where
 
-import Control.Monad.Except
+import Control.Monad        ( void )
+import Control.Monad.Except ( MonadError(..) )
 
 import Data.Semigroup
-import Data.Monoid
+import qualified Data.Set as Set
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
-import Agda.Syntax.Internal.Pattern
+import Agda.Syntax.Internal.MetaVars
 import Agda.Syntax.Position
 
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Coverage
 import Agda.TypeChecking.Coverage.Match ( fromSplitPatterns )
-import Agda.TypeChecking.Constraints
 import Agda.TypeChecking.Records
-import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Reduce ( instantiateFull )
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
 
 import Agda.Utils.Either
+import Agda.Utils.List
 import Agda.Utils.Monad
 
+import Agda.Utils.Impossible
+
 data ErrorNonEmpty
-  = Fail              -- ^ Generic failure
-  | FailBecause TCErr -- ^ Failure with informative error
-  | DontKnow          -- ^ Emptyness check blocked
+  = Fail               -- ^ Generic failure
+  | FailBecause TCErr  -- ^ Failure with informative error
+  | DontKnow Blocker   -- ^ Emptyness check blocked
 
 instance Semigroup ErrorNonEmpty where
-  DontKnow        <> _        = DontKnow
-  _               <> DontKnow = DontKnow
-  FailBecause err <> _        = FailBecause err
-  Fail            <> err      = err
+  DontKnow u1     <> DontKnow u2  = DontKnow $ unblockOnBoth u1 u2  -- Both must unblock for this to proceed
+  e@DontKnow{}    <> _            = e
+  _               <> e@DontKnow{} = e
+  FailBecause err <> _            = FailBecause err
+  Fail            <> err          = err
 
 instance Monoid ErrorNonEmpty where
   mempty  = Fail
   mappend = (Data.Semigroup.<>)
 
--- | Check whether a type is empty.
+-- | Ensure that a type is empty.
 --   This check may be postponed as emptiness constraint.
-isEmptyType
-  :: Range   -- ^ Range of the absurd pattern.
-  -> Type    -- ^ Type that should be empty (empty data type or iterated product of such).
+ensureEmptyType
+  :: Range -- ^ Range of the absurd pattern.
+  -> Type  -- ^ Type that should be empty (empty data type or iterated product of such).
   -> TCM ()
-isEmptyType r t = caseEitherM (checkEmptyType r t) failure return
+ensureEmptyType r t = caseEitherM (checkEmptyType r t) failure return
   where
-  failure DontKnow          = addConstraint $ IsEmpty r t
+  failure (DontKnow u)      = addConstraint u $ IsEmpty r t
   failure (FailBecause err) = throwError err
   failure Fail              = typeError $ ShouldBeEmpty t []
+
+-- | Check whether a type is empty.
+isEmptyType :: Type -> TCM Bool
+isEmptyType ty = isRight <$> checkEmptyType noRange ty
 
 -- | Check whether some type in a telescope is empty.
 isEmptyTel :: Telescope -> TCM Bool
@@ -62,7 +75,7 @@ checkEmptyType range t = do
   case mr of
 
     -- If t is blocked or a meta, we cannot decide emptiness now.  Postpone.
-    Left (Blocked m t) -> return $ Left DontKnow
+    Left (Blocked b t) -> return $ Left (DontKnow b)
 
     -- If t is not a record type, try to split
     Left (NotBlocked nb t) -> do
@@ -76,21 +89,27 @@ checkEmptyType range t = do
       dontAssignMetas $ do
         r <- splitLast Inductive tel ps
         case r of
-          Left UnificationStuck{} -> return $ Left DontKnow
+          Left UnificationStuck{} -> do
+            blocker <- unblockOnAnyMetaIn <$> instantiateFull tel -- TODO Jesper: get proper blocking information from unification
+            return $ Left $ DontKnow blocker
           Left _                  -> return $ Left Fail
           Right cov -> do
-            let ps = map (namedArg . last . fromSplitPatterns . scPats) $ splitClauses cov
+            let ps = map (namedArg . lastWithDefault __IMPOSSIBLE__ . fromSplitPatterns . scPats) $ splitClauses cov
             if (null ps) then return (Right ()) else
               Left . FailBecause <$> do typeError_ $ ShouldBeEmpty t ps
 
     -- If t is a record type, see if any of the field types is empty
     Right (r, pars, def) -> do
-      if recEtaEquality def == NoEta then return $ Left Fail else do
-        checkEmptyTel range $ recTel def `apply` pars
+      if | NoEta{} <- recEtaEquality def -> return $ Left Fail
+         | otherwise -> void <$> do checkEmptyTel range $ recTel def `apply` pars
 
-checkEmptyTel :: Range -> Telescope -> TCM (Either ErrorNonEmpty ())
-checkEmptyTel r EmptyTel          = return $ Left Fail
-checkEmptyTel r (ExtendTel dom tel) = orEitherM
-  [ checkEmptyType r (unDom dom)
-  , underAbstraction dom tel (checkEmptyTel r)
-  ]
+-- | Check whether one of the types in the given telescope is constructor-less
+--   and if yes, return its index in the telescope (0 = leftmost).
+checkEmptyTel :: Range -> Telescope -> TCM (Either ErrorNonEmpty Int)
+checkEmptyTel r = loop 0
+  where
+  loop i EmptyTel            = return $ Left Fail
+  loop i (ExtendTel dom tel) = orEitherM
+    [ (i <$) <$> checkEmptyType r (unDom dom)
+    , underAbstraction dom tel $ loop (succ i)
+    ]

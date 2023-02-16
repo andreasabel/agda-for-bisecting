@@ -1,4 +1,4 @@
-
+{-# OPTIONS --cubical-compatible #-}
 module Common.Prelude where
 
 

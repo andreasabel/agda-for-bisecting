@@ -1,56 +1,72 @@
-{-# LANGUAGE CPP #-}
 
-module Agda.TypeChecking.Monad.Imports where
+module Agda.TypeChecking.Monad.Imports
+  ( addImport
+  , addImportCycleCheck
+  , checkForImportCycle
+  , dropDecodedModule
+  , getDecodedModule
+  , getDecodedModules
+  , getImportPath
+  , getPrettyVisitedModules
+  , getVisitedModule
+  , getVisitedModules
+  , setDecodedModules
+  , setVisitedModules
+  , storeDecodedModule
+  , visitModule
+  , withImportPath
+  ) where
 
-import Control.Monad.State
-import Control.Monad.Reader
+import Control.Arrow   ( (***) )
+import Control.Monad   ( when )
 
-import Data.Set (Set)
+import qualified Data.HashSet as HSet
 import qualified Data.Map as Map
-import qualified Data.Set as Set
 
 import Agda.Syntax.Abstract.Name
-import qualified Agda.Syntax.Concrete.Name as C
+import Agda.Syntax.TopLevelModuleName
 import Agda.TypeChecking.Monad.Base
-import Agda.Utils.Lens
-import Agda.Utils.List ( caseListM )
-import Agda.Utils.Monad
 
-#include "undefined.h"
+import Agda.Utils.List ( caseListM )
+import Agda.Utils.Pretty
+
+
 import Agda.Utils.Impossible
 
-addImport :: ModuleName -> TCM ()
-addImport m = modifyTCLens stImportedModules $ Set.insert m
+addImport :: TopLevelModuleName -> TCM ()
+addImport top = modifyTCLens' stImportedModules $ HSet.insert top
 
-addImportCycleCheck :: C.TopLevelModuleName -> TCM a -> TCM a
+addImportCycleCheck :: TopLevelModuleName -> TCM a -> TCM a
 addImportCycleCheck m =
     localTC $ \e -> e { envImportPath = m : envImportPath e }
 
-getImports :: TCM (Set ModuleName)
-getImports = useTC stImportedModules
-
-isImported :: ModuleName -> TCM Bool
-isImported m = Set.member m <$> getImports
-
-getImportPath :: TCM [C.TopLevelModuleName]
+getImportPath :: TCM [TopLevelModuleName]
 getImportPath = asksTC envImportPath
 
 visitModule :: ModuleInfo -> TCM ()
 visitModule mi =
   modifyTCLens stVisitedModules $
-    Map.insert (toTopLevelModuleName $ iModuleName $ miInterface mi) mi
+    Map.insert (iTopLevelModuleName $ miInterface mi) mi
 
 setVisitedModules :: VisitedModules -> TCM ()
 setVisitedModules ms = setTCLens stVisitedModules ms
 
-getVisitedModules :: TCM VisitedModules
+getVisitedModules :: ReadTCState m => m VisitedModules
 getVisitedModules = useTC stVisitedModules
 
-isVisited :: C.TopLevelModuleName -> TCM Bool
-isVisited x = Map.member x <$> useTC stVisitedModules
+getPrettyVisitedModules :: ReadTCState m => m Doc
+getPrettyVisitedModules = do
+  visited <-  fmap (uncurry (<>) . (pretty *** (prettyCheckMode . miMode))) . Map.toList
+          <$> getVisitedModules
+  return $ hcat $ punctuate ", " visited
+  where
+  prettyCheckMode :: ModuleCheckMode -> Doc
+  prettyCheckMode ModuleTypeChecked                  = ""
+  prettyCheckMode ModuleScopeChecked                 = " (scope only)"
 
-getVisitedModule :: C.TopLevelModuleName
-                 -> TCM (Maybe ModuleInfo)
+getVisitedModule :: ReadTCState m
+                 => TopLevelModuleName
+                 -> m (Maybe ModuleInfo)
 getVisitedModule x = Map.lookup x <$> useTC stVisitedModules
 
 getDecodedModules :: TCM DecodedModules
@@ -60,19 +76,19 @@ setDecodedModules :: DecodedModules -> TCM ()
 setDecodedModules ms = modifyTC $ \s ->
   s { stPersistentState = (stPersistentState s) { stDecodedModules = ms } }
 
-getDecodedModule :: C.TopLevelModuleName -> TCM (Maybe Interface)
+getDecodedModule :: TopLevelModuleName -> TCM (Maybe ModuleInfo)
 getDecodedModule x = Map.lookup x . stDecodedModules . stPersistentState <$> getTC
 
-storeDecodedModule :: Interface -> TCM ()
-storeDecodedModule i = modifyTC $ \s ->
+storeDecodedModule :: ModuleInfo -> TCM ()
+storeDecodedModule mi = modifyTC $ \s ->
   s { stPersistentState =
         (stPersistentState s) { stDecodedModules =
-          Map.insert (toTopLevelModuleName $ iModuleName i) i $
-            (stDecodedModules $ stPersistentState s)
+          Map.insert (iTopLevelModuleName $ miInterface mi) mi $
+            stDecodedModules (stPersistentState s)
         }
   }
 
-dropDecodedModule :: C.TopLevelModuleName -> TCM ()
+dropDecodedModule :: TopLevelModuleName -> TCM ()
 dropDecodedModule x = modifyTC $ \s ->
   s { stPersistentState =
         (stPersistentState s) { stDecodedModules =
@@ -80,7 +96,7 @@ dropDecodedModule x = modifyTC $ \s ->
                               }
   }
 
-withImportPath :: [C.TopLevelModuleName] -> TCM a -> TCM a
+withImportPath :: [TopLevelModuleName] -> TCM a -> TCM a
 withImportPath path = localTC $ \e -> e { envImportPath = path }
 
 -- | Assumes that the first module in the import path is the module we are

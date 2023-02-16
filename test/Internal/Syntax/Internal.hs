@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP             #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module Internal.Syntax.Internal ( tests ) where
@@ -8,23 +7,25 @@ import Agda.TypeChecking.Substitute ()
 
 import Internal.Helpers
 import Internal.Syntax.Common ()
+import Internal.Syntax.Abstract.Name ()
 
 ------------------------------------------------------------------------
 -- Instances
 
 instance Arbitrary NotBlocked where
-  arbitrary = elements [ Underapplied
-                       , AbsurdMatch
-                       , MissingClauses
-                       , ReallyNotBlocked
-                       -- , StuckOn Elim  -- TODO
-                       ]
+  arbitrary = oneof
+    [ pure Underapplied
+    , pure AbsurdMatch
+    , MissingClauses <$> arbitrary
+    , pure ReallyNotBlocked
+    -- , StuckOn Elim  -- TODO
+    ]
 
 instance Arbitrary (Blocked ()) where
   arbitrary = do
     m  <- arbitrary
     bs <- arbitrary
-    elements [ Blocked m (), NotBlocked bs () ]
+    elements [ blocked_ m, NotBlocked bs () ]
 
 ------------------------------------------------------------------------------
 -- Properties

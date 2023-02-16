@@ -11,13 +11,14 @@ all : Issue1168.api PrettyInterface.api ScopeFromInterface.api
 
 %.api : %.agdai %.hs
 	$(eval tmpdir = $(shell mktemp -d /tmp/api-test.XXXX))
-ifneq ("$(wildcard ../../stack.yaml)","") # if `stack.yaml` exists
-	stack ghc -- -Wall -Werror -o $(tmpdir)/$* $*.hs
-else
-	ghc -Wall -Werror -package Agda-$(VERSION) -o $(tmpdir)/$* $*.hs
-endif
+	$(GHC) -Wall -Werror -package Agda-$(VERSION) -o $(tmpdir)/$* $*.hs
 	$(tmpdir)/$*
 	rm -r $(tmpdir)
 
 clean :
 	rm -f *.agdai *.hi *.o
+
+debug :
+	@echo "GHC     = ${GHC}"
+	@echo "AGDA    = ${AGDA}"
+	@echo "VERSION = ${VERSION}"
