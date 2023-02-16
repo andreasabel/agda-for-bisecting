@@ -67,7 +67,7 @@ jobs:
     - name: Bisect
       run: |
         agda-bisect \
-          --skip-skipped --cabal-option -f-enable-cluster-counting \
+          --skip-skipped --cabal-option=-j2 --cabal-option=-f-enable-cluster-counting \
           --good 3b17931b79b9e447666ec4909898b59e4dc1c197 \
           --bad v2.6.0 \
           --timeout 5 Issue6509.agda
