@@ -44,7 +44,8 @@ jobs:
     - uses: actions/cache/restore@v3
       with:
         path: ${{ steps.setup.outputs.cabal-store }}
-        key:  bisect-${{ runner.os }}-${{ github.sha }}
+        key:          bisect-${{ runner.os }}-${{ github.sha }}
+        restore-keys: bisect-${{ runner.os }}-
 
     - name: Install agda-bisect from PR
       working-directory: src/agda-bisect
