@@ -1,0 +1,29 @@
+# Bisect agda
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    env:
+      GHC_VER: '8.2.2'
+
+    steps:
+
+    - uses: actions/checkout@v3
+
+    - uses: haskell/actions/setup@v2
+      with:
+        ghc-version: ${{ env.GHC_VER }}
+
+    - name: Install agda-bisect from PR
+      working-directory: src/agda-bisect
+      run: |
+        git checkout bisect-v2
+        cabal install
+
+    - name: Bisect
+      run: |
+        agda-bisect --timeout 5 --skip-skipped --bad v2.6.0 --good 3b17931b79b9e447666ec4909898b59e4dc1c197 --cabal-option -f-enable-cluster-counting Issue6509.agda
