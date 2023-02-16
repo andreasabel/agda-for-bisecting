@@ -17,24 +17,19 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Ensure bin dir
-      run: |
-        mkdir -p "$HOME/.cabal/bin"
-        echo "$HOME/.cabal/bin" >> "${GITHUB_PATH}"
+    # - name: Ensure bin dir
+    #   run: |
+    #     mkdir -p "$HOME/.cabal/bin"
+    #     echo "$HOME/.cabal/bin" >> "${GITHUB_PATH}"
 
-    - name: Install cabal-plan
-      run: |
-        curl -sL https://github.com/haskell-hvr/cabal-plan/releases/download/v0.6.2.0/cabal-plan-0.6.2.0-x86_64-linux.xz > cabal-plan.xz
-        echo 'de73600b1836d3f55e32d80385acc055fd97f60eaa0ab68a755302685f5d81bc  cabal-plan.xz' | sha256sum -c -
-        xz -d < cabal-plan.xz > "$HOME/.cabal/bin/cabal-plan"
-        rm -f cabal-plan.xz
-        chmod a+x "$HOME/.cabal/bin/cabal-plan"
-        cabal-plan --version
-
-    - name: Switch to agda-bisect PR
-      run: |
-        git fetch origin bisect-v2
-        git checkout bisect-v2
+    # - name: Install cabal-plan
+    #   run: |
+    #     curl -sL https://github.com/haskell-hvr/cabal-plan/releases/download/v0.6.2.0/cabal-plan-0.6.2.0-x86_64-linux.xz > cabal-plan.xz
+    #     echo 'de73600b1836d3f55e32d80385acc055fd97f60eaa0ab68a755302685f5d81bc  cabal-plan.xz' | sha256sum -c -
+    #     xz -d < cabal-plan.xz > "$HOME/.cabal/bin/cabal-plan"
+    #     rm -f cabal-plan.xz
+    #     chmod a+x "$HOME/.cabal/bin/cabal-plan"
+    #     cabal-plan --version
 
     - uses: haskell/actions/setup@v2
       id:   setup
@@ -46,6 +41,17 @@ jobs:
         path: ${{ steps.setup.outputs.cabal-store }}
         key:          bisect-${{ runner.os }}-${{ github.sha }}
         restore-keys: bisect-${{ runner.os }}-
+
+    - name: Install cabal-plan >= 0.7.1.0 from hackage
+      # Latest (0.7.2.3) works for GHC >= 8.2
+      # 0.7.1.0 works for GHC 7.6 - 8.10
+      run: |
+        cabal install cabal-plan
+
+    - name: Switch to agda-bisect PR
+      run: |
+        git fetch origin bisect-v2
+        git checkout bisect-v2
 
     - name: Install agda-bisect from PR
       working-directory: src/agda-bisect
@@ -60,7 +66,11 @@ jobs:
 
     - name: Bisect
       run: |
-        agda-bisect --timeout 5 --skip-skipped --bad v2.6.0 --good 3b17931b79b9e447666ec4909898b59e4dc1c197 --cabal-option -f-enable-cluster-counting Issue6509.agda
+        agda-bisect \
+          --skip-skipped --cabal-option -f-enable-cluster-counting \
+          --good 3b17931b79b9e447666ec4909898b59e4dc1c197 \
+          --bad v2.6.0 \
+          --timeout 5 Issue6509.agda
 
     - uses: actions/cache/save@v3
       if:   always()
