@@ -12,7 +12,10 @@ jobs:
 
     steps:
 
-    - uses: actions/checkout@v3
+    - name: Full clone of repo
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
     - name: Switch to agda-bisect PR
       run: |
@@ -20,8 +23,14 @@ jobs:
         git checkout bisect-v2
 
     - uses: haskell/actions/setup@v2
+      id:   setup
       with:
         ghc-version: ${{ env.GHC_VER }}
+
+    - uses: actions/cache/restore@v3
+      with:
+        path: ${{ steps.setup.outputs.cabal-store }}
+        key:  bisect-${{ runner.os }}-${{ github.sha }}
 
     - name: Install agda-bisect from PR
       working-directory: src/agda-bisect
@@ -32,7 +41,15 @@ jobs:
     - name: Switch to master
       run: |
         git checkout master
+      continue-on-error: true
 
     - name: Bisect
       run: |
         agda-bisect --timeout 5 --skip-skipped --bad v2.6.0 --good 3b17931b79b9e447666ec4909898b59e4dc1c197 --cabal-option -f-enable-cluster-counting Issue6509.agda
+
+    - uses: actions/cache/save@v3
+      if:   always()
+      with:
+        path: ${{ steps.setup.outputs.cabal-store }}
+        key:  bisect-${{ runner.os }}-${{ github.sha }}
+      continue-on-error: true
